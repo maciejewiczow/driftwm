@@ -184,7 +184,8 @@ window-search script that lets you search and jump to any open window.
 
 ### Fedora (prebuilt binary)
 
-Built on Fedora 43, requires glibc ≥ 2.39:
+Built on Fedora 43, x86_64 only, requires glibc ≥ 2.39. aarch64 users:
+[build from source](#build-from-source).
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/malbiruk/driftwm/main/install.sh | sudo sh
