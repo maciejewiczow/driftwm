@@ -114,8 +114,10 @@
 # shadow = true                  # drop shadow under window chrome
 # default_mode = "client"        # decoration mode for windows without a rule.
                                  # "client":  CSD — client draws its own titlebar (default)
-                                 # "minimal": SSD — no titlebar, just shadow + corners
-                                 # "none":    SSD — bare client surface, no chrome
+                                 # "minimal": SSD — no titlebar; shadow, corners, and border
+                                 #            still apply via [decorations] + per-window rules
+                                 # "none":    bare client surface — compositor adds zero chrome;
+                                 #            per-window border/corner/shadow rules are ignored
                                  #
                                  # "server" (driftwm titlebar) is intentionally not allowed as a
                                  # global default: many toolkits (GTK, Electron) ignore
@@ -415,32 +417,37 @@
 #                Omit to inherit default_mode. Values:
 #                "client":  CSD — client's own titlebar
 #                "server":  SSD — driftwm's titlebar
-#                "minimal": SSD — no titlebar, but shadow + corner clip
-#                "none":    SSD — completely bare, no chrome at all
+#                "minimal": SSD — no titlebar, just shadow + corners + border
+#                            (this is the mode for chrome-on-borderless widgets;
+#                            border_width / corner_radius / shadow rules apply)
+#                "none":    bare client surface — compositor adds zero chrome,
+#                            and per-window border_width / corner_radius /
+#                            shadow rules are ignored. Use "minimal" if you
+#                            want chrome without a titlebar.
 #   blur       — true: blur background behind this window (default: false)
 #   opacity    — 0.0–1.0: window transparency (default: 1.0, fully opaque)
-#   border_width         — per-window border width override (px). Set on a
-#                          decoration = "none" rule to give a widget a border.
-#                          Set to 0 to disable border on a window even when
-#                          [decorations] border_width > 0.
+#   border_width         — per-window border width override (px). Set to 0 to
+#                          disable border on a window even when [decorations]
+#                          border_width > 0. Ignored for decoration = "none".
 #   border_color         — per-window unfocused border color hex (e.g. "#5c5c5c").
 #   border_color_focused — per-window focused border color hex.
-#   corner_radius        — per-window corner radius override (px). Overrides
-#                          [decorations] corner_radius for this window. Affects
-#                          content clip, border shape, and shadow. Set on a
-#                          decoration = "none" rule to round the border on a
-#                          widget (content stays unclipped in that mode).
-#   shadow               — per-window shadow toggle. Default is on for client/
-#                          server/minimal modes and off for decoration = "none".
-#                          Set true on a decoration = "none" rule to give a
-#                          widget a shadow, or false on a chrome'd window to
-#                          disable it.
+#   corner_radius        — per-window corner radius override (px). Affects
+#                          content clip, border shape, and shadow. Ignored for
+#                          decoration = "none".
+#   shadow               — per-window shadow toggle. Overrides [decorations]
+#                          shadow. Ignored for decoration = "none".
 #   pass_keys  — controls which compositor keybindings are forwarded to the app:
 #                  pass_keys = true           → forward ALL keys (game-friendly)
 #                  pass_keys = ["mod+q",      → forward ONLY these combos; all other
 #                               "ctrl+q"]       compositor shortcuts stay active
 #                  pass_keys = false / omit   → compositor handles everything (default)
 #                VT switching (Ctrl+Alt+F1–F12) always stays in the compositor.
+#
+# Layer-shell surfaces (panels, notifications, bars like waybar):
+#   `decoration` is ignored — layers have no decoration mode. Chrome
+#   (border_width, corner_radius, shadow) is field-by-field opt-in on the rule
+#   and does NOT inherit from [decorations]. Without explicit values on the
+#   rule, a layer surface has no border, no shadow, and no corner clip.
 #
 # Examples:
 #

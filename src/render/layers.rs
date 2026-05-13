@@ -43,29 +43,18 @@ fn push_layer_chrome(
         Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
     ),
 ) -> usize {
-    // Layer-shell widgets opt into chrome only via `decoration = "minimal"`.
-    // Absent / "none" / "client" / "server" all yield no chrome unless a
-    // per-rule border/shadow/corner_radius override applies — layers never
-    // inherit the global `default_mode`, which is window-only.
-    let layer_mode = match applied.and_then(|r| r.decoration.as_ref()) {
-        Some(driftwm::config::DecorationMode::Minimal) => {
-            driftwm::config::DecorationMode::Minimal
-        }
-        _ => driftwm::config::DecorationMode::None,
-    };
-    let border_width = driftwm::config::effective_border_width(
-        applied,
-        &layer_mode,
-        &state.config.decorations,
-    );
-    let border_color = driftwm::config::effective_border_color(applied, &state.config.decorations);
-    let corner_radius = driftwm::config::effective_corner_radius(
-        applied,
-        &layer_mode,
-        &state.config.decorations,
-    );
-    let shadow_enabled =
-        driftwm::config::effective_shadow_enabled(applied, &layer_mode, &state.config.decorations);
+    // Layer-shell surfaces don't have a decoration mode (no titlebar, no
+    // SSD/CSD distinction). The `decoration` field is ignored on layer rules;
+    // chrome is opt-in field-by-field. `[decorations]` values are NOT
+    // inherited for layers — set border_width / corner_radius / shadow
+    // explicitly per rule. border_color falls back to the global setting
+    // only as a color default when a border width has been set.
+    let border_width = applied.and_then(|r| r.border_width).unwrap_or(0);
+    let corner_radius = applied.and_then(|r| r.corner_radius).unwrap_or(0);
+    let shadow_enabled = applied.and_then(|r| r.shadow).unwrap_or(false);
+    let border_color = applied
+        .and_then(|r| r.border_color)
+        .unwrap_or(state.config.decorations.border_color);
 
     // Clone shaders so the immutable borrow on `state.render.*_shader` drops
     // before we reborrow `state.render.{border,shadow}_cache` mutably below.

@@ -431,9 +431,9 @@ pub fn compose_frame(
             let geo = window.geometry();
             let radius = effective_corner_radius as f32;
 
-            // Only `None` mode opts out of shadow + corner clipping.
-            // Client (CSD), Minimal, and untagged windows all get the chrome —
-            // any `Server` window would have taken the `has_ssd` branch above.
+            // `decoration = "none"` hard-vetoes compositor chrome: the client
+            // surface is passed through untouched (no clip, no border, no
+            // shadow). Use `minimal` for titlebar-less chrome opt-ins.
             let effective = driftwm::config::effective_decoration_mode(
                 applied.as_ref().and_then(|r| r.decoration.as_ref()),
                 &state.config.decorations.default_mode,
@@ -509,80 +509,9 @@ pub fn compose_frame(
                     shadow_count = 1;
                 }
             } else {
-                // For a bare window with a non-zero corner radius, the
-                // border/shadow agree on a rounded outline — the surface must
-                // match, or its square corners poke through the border's
-                // inner cutout and the shadow bleeds at those corners.
-                // Fullscreen always uses plain elements (no clip).
-                if bare && !is_fullscreen && effective_corner_radius > 0 {
-                    let geometry = Rectangle::new(
-                        Point::<f64, Logical>::from((
-                            render_loc.x + geo.loc.x as f64,
-                            render_loc.y + geo.loc.y as f64,
-                        )),
-                        Size::<f64, Logical>::from((geom_size.w as f64, geom_size.h as f64)),
-                    );
-                    let r = effective_corner_radius as f32;
-                    push_corner_clipped_elements(
-                        target, elems, shader,
-                        geometry, [r, r, r, r], zoom, output_scale,
-                    );
-                } else {
-                    push_plain_elements(target, elems, zoom);
-                }
-                // decoration = "none" (and not fullscreen) can opt into a
-                // border, rounded corners, or a shadow via window rules.
-                if bare && !is_fullscreen && effective_bw > 0
-                    && let Some(border_shader) = state.render.border_shader.clone()
-                {
-                    let inner_logical: Rectangle<f64, Logical> = Rectangle::new(
-                        (render_loc.x + geo.loc.x as f64, render_loc.y + geo.loc.y as f64).into(),
-                        (geom_size.w as f64, geom_size.h as f64).into(),
-                    );
-                    push_border_element(
-                        target,
-                        &mut state.render.border_cache,
-                        wl_surface.id(),
-                        &border_shader,
-                        inner_logical,
-                        effective_corner_radius as f32,
-                        effective_bw,
-                        border_color,
-                        is_focused,
-                        opacity,
-                        scale,
-                        zoom,
-                    );
-                }
-                if bare && effective_shadow
-                    && let Some(shader) = state.render.shadow_shader.clone()
-                {
-                    let bw = effective_bw as f64;
-                    let body_logical: Rectangle<f64, Logical> = Rectangle::new(
-                        (
-                            render_loc.x + geo.loc.x as f64 - bw,
-                            render_loc.y + geo.loc.y as f64 - bw,
-                        )
-                            .into(),
-                        (
-                            geom_size.w as f64 + 2.0 * bw,
-                            geom_size.h as f64 + 2.0 * bw,
-                        )
-                            .into(),
-                    );
-                    push_shadow_element(
-                        target,
-                        &mut state.render.shadow_cache,
-                        wl_surface.id(),
-                        &shader,
-                        body_logical,
-                        (effective_corner_radius + effective_bw) as f32,
-                        opacity,
-                        scale,
-                        zoom,
-                    );
-                    shadow_count = 1;
-                }
+                // Bare (`decoration = "none"`) or fullscreen: pass the client
+                // surface through with no compositor chrome.
+                push_plain_elements(target, elems, zoom);
             }
         } else {
             push_plain_elements(target, elems, zoom);

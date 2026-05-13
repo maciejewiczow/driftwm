@@ -126,7 +126,17 @@ impl CompositorHandler for DriftWm {
         // artifacts where the damage tracker skips background redraws.
         // NOTE: only effective for ARGB buffers — XRGB buffers are handled in
         // RoundedCornerElement::opaque_regions() at render time.
-        if !self.decorations.contains_key(&surface.id()) {
+        // Skipped entirely for `decoration = "none"` (pass-through promise — the
+        // compositor doesn't modify the client's declared opaque region either).
+        let csd_corner_carve = !self.decorations.contains_key(&surface.id()) && {
+            let applied = driftwm::config::applied_rule(surface);
+            let mode = driftwm::config::effective_decoration_mode(
+                applied.as_ref().and_then(|r| r.decoration.as_ref()),
+                &self.config.decorations.default_mode,
+            );
+            !matches!(mode, driftwm::config::DecorationMode::None)
+        };
+        if csd_corner_carve {
             with_states(surface, |states| {
                 if states.data_map.get::<XdgToplevelSurfaceData>().is_none() {
                     return;

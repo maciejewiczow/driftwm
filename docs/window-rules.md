@@ -68,6 +68,10 @@ Regex patterns use the `regex` crate (RE2-compatible, no backreferences).
 
 ## Effect fields
 
+The table below describes how each field behaves on rules matching regular
+windows (xdg-toplevels). Layer-shell surfaces interpret chrome fields
+differently — see [Layer-shell surfaces](#layer-shell-surfaces) below.
+
 | Field                  | Type                     | Default   | Description                                                                                                                                              |
 | ---------------------- | ------------------------ | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `position`             | `[x, y]`                 | —         | Place window at canvas coordinates (window center, Y-up)                                                                                                 |
@@ -76,21 +80,42 @@ Regex patterns use the `regex` crate (RE2-compatible, no backreferences).
 | `decoration`           | string                   | inherited | Override decoration mode (see below)                                                                                                                     |
 | `blur`                 | `bool`                   | `false`   | Blur compositor background behind this window                                                                                                            |
 | `opacity`              | `0.0`–`1.0`              | `1.0`     | Window transparency (1.0 = fully opaque)                                                                                                                 |
-| `border_width`         | px                       | inherited | Border width override. Set on a `decoration = "none"` rule to give a widget a border. Set to `0` to disable the border even when global width is `> 0`.  |
+| `border_width`         | px                       | inherited | Border width override. Set to `0` to disable the border even when global width is `> 0`. Ignored for `decoration = "none"`.                              |
 | `border_color`         | `"#rrggbb[aa]"`          | inherited | Per-window unfocused border color                                                                                                                        |
 | `border_color_focused` | `"#rrggbb[aa]"`          | inherited | Per-window focused border color                                                                                                                          |
-| `corner_radius`        | px                       | inherited | Per-window corner radius override. Affects content clip, border shape, and shadow. On `decoration = "none"`, only the border shape uses it.              |
-| `shadow`               | `bool`                   | mode-dep. | Per-window shadow toggle. Default: on for `client`/`server`/`minimal`, off for `none`. Set `true` on `decoration = "none"` to give a widget a shadow.    |
+| `corner_radius`        | px                       | inherited | Per-window corner radius override. Affects content clip, border shape, and shadow. Ignored for `decoration = "none"`.                                    |
+| `shadow`               | `bool`                   | inherited | Per-window shadow toggle. Overrides `[decorations] shadow`. Ignored for `decoration = "none"`.                                                           |
 | `pass_keys`            | `bool` or `["combo", …]` | `false`   | Forward keys to the app — see below                                                                                                                      |
 
 ### `decoration` values
 
-| Value          | Description                                        |
-| -------------- | -------------------------------------------------- |
-| `"client"`     | CSD — client draws its own titlebar (default)      |
-| `"server"`     | SSD — driftwm draws a titlebar with a close button |
-| `"minimal"`    | SSD — no titlebar, but shadow + corner clipping    |
-| `"none"`       | SSD — completely bare, no chrome at all            |
+| Value          | Description                                                                                              |
+| -------------- | -------------------------------------------------------------------------------------------------------- |
+| `"client"`     | CSD — client draws its own titlebar (default)                                                            |
+| `"server"`     | SSD — driftwm draws a titlebar with a close button                                                       |
+| `"minimal"`    | SSD — no titlebar; shadow, corner clip, and border still apply per `[decorations]` / per-window rules    |
+| `"none"`       | Bare client surface — compositor adds zero chrome; per-window border/corner/shadow rules are ignored too |
+
+### Layer-shell surfaces
+
+Layer-shell surfaces (panels, notifications, bars like waybar) have no decoration
+mode — the `decoration` field on a rule matching a layer surface is ignored.
+
+Chrome on layers is **field-by-field opt-in**: set `border_width`,
+`corner_radius`, and/or `shadow` directly on the rule. Layers do **not** inherit
+`[decorations]` defaults for those three fields — without an explicit value on
+the rule, a layer surface has no border, no shadow, and no corner clipping.
+`border_color_focused` is also ignored on layers (the focused / unfocused
+distinction is window-only); layers always use `border_color`.
+
+```toml
+[[window_rules]]
+app_id        = "waybar"
+widget        = true
+corner_radius = 10
+shadow        = true
+border_width  = 2
+```
 
 ### `pass_keys` details
 
@@ -202,19 +227,22 @@ opacity = 1.0        # override opacity for nvim (blur still applies)
 
 ### Widget with a custom border and shadow
 
-`decoration = "none"` skips all compositor chrome by default. Window rules can
-add it back per-app:
+`decoration = "minimal"` gives you a titlebar-less window that still participates
+in compositor chrome — borders, corner clipping, and shadow all apply. Use it
+when you want a widget that isn't fully bare. `decoration = "none"` is the
+opposite: a bare client surface where the compositor adds (and ignores) all
+chrome overrides.
 
 ```toml
 [[window_rules]]
 app_id               = "my-clock"
 widget               = true
-decoration           = "none"
+decoration           = "minimal"
 border_width         = 2
 border_color         = "#5c5c5c"
 border_color_focused = "#7aa2f7"
-corner_radius        = 8       # rounded border shape
-shadow               = true    # off by default for decoration = "none"
+corner_radius        = 8
+shadow               = true
 ```
 
 ### Disable shadow on a specific app

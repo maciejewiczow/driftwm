@@ -548,16 +548,17 @@ pub struct WindowRule {
     pub blur: bool,
     pub opacity: Option<f64>,
     pub pass_keys: PassKeys,
-    /// Per-window border overrides. `None` means inherit the global value
-    /// (or, for `decoration = "none"`, fall through to "no border").
+    /// Per-window border overrides. Ignored for `decoration = "none"` —
+    /// use `minimal` mode for a titlebar-less window that still wants a
+    /// border. `None` means inherit the global value.
     pub border_width: Option<i32>,
     pub border_color: Option<[u8; 4]>,
     pub border_color_focused: Option<[u8; 4]>,
-    /// Per-window corner radius override. `None` means inherit the global
-    /// value (or, for `decoration = "none"`, fall through to 0).
+    /// Per-window corner radius override. Ignored for `decoration = "none"`.
+    /// `None` means inherit the global value.
     pub corner_radius: Option<i32>,
-    /// Per-window shadow toggle. `None` means inherit the mode default
-    /// (on for SSD/CSD/minimal, off for `decoration = "none"`).
+    /// Per-window shadow toggle. Ignored for `decoration = "none"`. `None`
+    /// means inherit `[decorations] shadow`.
     pub shadow: Option<bool>,
 }
 
@@ -717,8 +718,7 @@ pub struct DecorationConfig {
     /// Default decoration mode for windows without a matching rule.
     pub default_mode: DecorationMode,
     /// Border width in pixels. `0` disables the border. Applies to `client`,
-    /// `server`, and `minimal` modes; `none` opts out unless a window rule
-    /// overrides explicitly.
+    /// `server`, and `minimal` modes; `none` always renders without a border.
     pub border_width: i32,
     pub border_color: [u8; 4],
     pub border_color_focused: [u8; 4],
@@ -741,21 +741,21 @@ impl Default for DecorationConfig {
     }
 }
 
-/// Effective border width for a window. Per-window rule wins; otherwise fall
-/// back to the global value unless the resolved decoration mode is `None`
-/// (which opts out of the global border).
+/// Effective border width for a window. `decoration = "none"` hard-vetoes the
+/// border — use `minimal` if you want a borderless titlebar but still want to
+/// opt into a per-window border. Otherwise per-window rule wins, then global.
 pub fn effective_border_width(
     applied: Option<&AppliedWindowRule>,
     mode: &DecorationMode,
     decorations: &DecorationConfig,
 ) -> i32 {
+    if matches!(mode, DecorationMode::None) {
+        return 0;
+    }
     if let Some(bw) = applied.and_then(|r| r.border_width) {
         return bw;
     }
-    match mode {
-        DecorationMode::None => 0,
-        _ => decorations.border_width,
-    }
+    decorations.border_width
 }
 
 /// Effective border color: per-window rule wins, else fall back to global.
@@ -779,34 +779,37 @@ pub fn effective_border_color_focused(
         .unwrap_or(decorations.border_color_focused)
 }
 
-/// Effective corner radius for a window. Per-window rule wins; otherwise fall
-/// back to the global value unless the resolved decoration mode is `None`
-/// (which has straight corners by design).
+/// Effective corner radius for a window. `decoration = "none"` hard-vetoes
+/// corner clipping (the client surface is passed through as-is). Otherwise
+/// per-window rule wins, then global.
 pub fn effective_corner_radius(
     applied: Option<&AppliedWindowRule>,
     mode: &DecorationMode,
     decorations: &DecorationConfig,
 ) -> i32 {
+    if matches!(mode, DecorationMode::None) {
+        return 0;
+    }
     if let Some(cr) = applied.and_then(|r| r.corner_radius) {
         return cr;
     }
-    match mode {
-        DecorationMode::None => 0,
-        _ => decorations.corner_radius,
-    }
+    decorations.corner_radius
 }
 
-/// Whether to render the compositor shadow for a window. Per-window rule wins;
-/// otherwise on for modes that draw chrome and off for `decoration = "none"`.
+/// Whether to render the compositor shadow for a window. `decoration = "none"`
+/// hard-vetoes the shadow. Otherwise per-window rule wins, then global.
 pub fn effective_shadow_enabled(
     applied: Option<&AppliedWindowRule>,
     mode: &DecorationMode,
     decorations: &DecorationConfig,
 ) -> bool {
+    if matches!(mode, DecorationMode::None) {
+        return false;
+    }
     if let Some(s) = applied.and_then(|r| r.shadow) {
         return s;
     }
-    decorations.shadow && !matches!(mode, DecorationMode::None)
+    decorations.shadow
 }
 
 impl DecorationConfig {

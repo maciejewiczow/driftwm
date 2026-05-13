@@ -1056,8 +1056,8 @@ impl DriftWm {
 
     /// Effective border width for a window, resolving per-window rule
     /// override against the global `[decorations] border_width`. Returns 0
-    /// when the effective decoration mode is `None` and no per-window
-    /// override is set.
+    /// when the effective decoration mode is `None` (hard veto — per-window
+    /// overrides are ignored in that case).
     pub fn window_border_width(&self, surface: &WlSurface) -> i32 {
         let applied = driftwm::config::applied_rule(surface);
         let mode = driftwm::config::effective_decoration_mode(
