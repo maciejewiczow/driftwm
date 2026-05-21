@@ -206,6 +206,7 @@ impl DriftWm {
             backend: None,
             decorations: HashMap::new(),
             pending_ssd: HashSet::new(),
+            decoration_scale: 1,
             render: RenderCache::new(),
             dmabuf_state: DmabufState::new(),
             dmabuf_global: None,

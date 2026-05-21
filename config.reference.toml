@@ -110,9 +110,22 @@
 
 [decorations]
 # bg_color = "#303030"           # title bar background (default: dark gray)
-# fg_color = "#FFFFFF"           # close button × color (default: white)
+# fg_color = "#FFFFFF"           # title text + close button × color (default: white)
 # corner_radius = 10             # clip window corners to this radius
 # shadow = true                  # drop shadow under window chrome
+
+# SSD title bar text. The font is resolved via fontconfig — install the
+# `adwaita-fonts` package for the default look; otherwise a generic sans is
+# substituted.
+# title_bar_height = 25          # SSD title bar height in px (default: 25)
+# font = "Adwaita Sans"          # title text font family
+# font_size = 11                 # title text size in points (default: 11)
+# font_weight = "medium"         # thin/extralight/light/regular/medium/
+                                 # semibold/bold/extrabold/black (default: medium)
+# title_align = "center"         # "left" or "center" (default: center). "center"
+                                 # centers short titles and left-aligns +
+                                 # ellipsizes long ones
+
 # default_mode = "client"        # decoration mode for windows without a rule.
                                  # "client":  CSD — client draws its own titlebar (default)
                                  # "minimal": SSD — no titlebar; shadow, corners, and border

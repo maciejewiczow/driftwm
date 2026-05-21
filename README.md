@@ -250,6 +250,11 @@ sudo pacman -S libdisplay-info libinput seatd mesa libxkbcommon
 > **Note:** Ubuntu 24.04 ships Rust 1.75 which is too old. Install via
 > [rustup](https://rustup.rs/) instead of `apt install rustc`.
 
+> **Optional:** SSD title bars render the window title in `Adwaita Sans` by
+> default (to match GTK apps). Install `adwaita-fonts` (Arch/Fedora) for the
+> intended look — without it a generic sans-serif is substituted. The font,
+> size, weight, and alignment are configurable under `[decorations]`.
+
 Then build and install:
 
 ```bash

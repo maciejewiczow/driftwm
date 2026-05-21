@@ -12,8 +12,9 @@ use super::toml::{
     OutputRuleFile, PassKeysFile, WindowRuleFile,
 };
 use super::types::{
-    BackendConfig, DecorationConfig, DecorationMode, EffectsConfig, KeyCombo, ModKey, OutputConfig,
-    OutputMode, OutputOutlineSettings, OutputPosition, PassKeys, Pattern, WindowRule,
+    BackendConfig, DecorationConfig, DecorationMode, EffectsConfig, FontWeight, KeyCombo, ModKey,
+    OutputConfig, OutputMode, OutputOutlineSettings, OutputPosition, PassKeys, Pattern, TitleAlign,
+    WindowRule,
 };
 
 pub(super) fn parse_color(s: &str) -> Option<[u8; 4]> {
@@ -86,6 +87,36 @@ pub(super) fn parse_decoration_config(raw: DecorationFileConfig) -> DecorationCo
         }
     };
 
+    let font_weight = match raw
+        .font_weight
+        .as_deref()
+        .map(|s| s.trim().to_lowercase())
+        .as_deref()
+    {
+        Some("thin" | "hairline") => FontWeight::Thin,
+        Some("extralight" | "extra-light" | "ultralight") => FontWeight::ExtraLight,
+        Some("light") => FontWeight::Light,
+        Some("normal" | "regular") => FontWeight::Normal,
+        Some("medium") | None => FontWeight::Medium,
+        Some("semibold" | "semi-bold" | "demibold") => FontWeight::SemiBold,
+        Some("bold") => FontWeight::Bold,
+        Some("extrabold" | "extra-bold" | "ultrabold") => FontWeight::ExtraBold,
+        Some("black" | "heavy") => FontWeight::Black,
+        Some(other) => {
+            tracing::warn!("Unknown font_weight '{other}', using medium");
+            FontWeight::Medium
+        }
+    };
+
+    let title_align = match raw.title_align.as_deref() {
+        Some("left") => TitleAlign::Left,
+        Some("center") | None => TitleAlign::Center,
+        Some(other) => {
+            tracing::warn!("Unknown title_align '{other}', using center");
+            TitleAlign::Center
+        }
+    };
+
     DecorationConfig {
         bg_color: resolve(raw.bg_color, defaults.bg_color, "bg_color"),
         fg_color: resolve(raw.fg_color, defaults.fg_color, "fg_color"),
@@ -99,6 +130,14 @@ pub(super) fn parse_decoration_config(raw: DecorationFileConfig) -> DecorationCo
             "border_color_focused",
         ),
         shadow: raw.shadow.unwrap_or(defaults.shadow),
+        title_bar_height: raw
+            .title_bar_height
+            .unwrap_or(defaults.title_bar_height)
+            .max(1),
+        font: raw.font.unwrap_or(defaults.font),
+        font_size: raw.font_size.unwrap_or(defaults.font_size).max(1),
+        font_weight,
+        title_align,
     }
 }
 

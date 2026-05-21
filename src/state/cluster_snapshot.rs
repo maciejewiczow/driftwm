@@ -462,7 +462,7 @@ pub(crate) fn snap_targets_impl(
     cluster_excludes: &HashSet<WlSurface>,
 ) -> (Vec<driftwm::layout::snap::SnapRect>, i32, i32) {
     let self_bar = if decorations.contains_key(&primary.id()) {
-        driftwm::config::DecorationConfig::TITLE_BAR_HEIGHT
+        decoration_config.title_bar_height
     } else {
         0
     };
@@ -513,7 +513,7 @@ fn window_snap_rect(
     let loc = space.element_location(w)?;
     let size = w.geometry().size;
     let bar = if decorations.contains_key(&surface.id()) {
-        driftwm::config::DecorationConfig::TITLE_BAR_HEIGHT
+        decoration_config.title_bar_height
     } else {
         0
     };

@@ -92,7 +92,7 @@ differently — see [Layer-shell surfaces](#layer-shell-surfaces) below.
 | Value          | Description                                                                                              |
 | -------------- | -------------------------------------------------------------------------------------------------------- |
 | `"client"`     | CSD — client draws its own titlebar (default)                                                            |
-| `"server"`     | SSD — driftwm draws a titlebar with a close button                                                       |
+| `"server"`     | SSD — driftwm draws a titlebar with the window title and a close button                                  |
 | `"minimal"`    | SSD — no titlebar; shadow, corner clip, and border still apply per `[decorations]` / per-window rules    |
 | `"none"`       | Bare client surface — compositor adds zero chrome; per-window border/corner/shadow rules are ignored too |
 

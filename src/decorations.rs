@@ -3,7 +3,7 @@ use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 
-use driftwm::config::DecorationConfig;
+use driftwm::config::{DecorationConfig, TitleAlign};
 
 /// Per-window SSD decoration state.
 pub struct WindowDecoration {
@@ -11,6 +11,8 @@ pub struct WindowDecoration {
     pub width: i32,
     pub focused: bool,
     pub close_hovered: bool,
+    pub scale: i32,
+    pub title: String,
 }
 
 /// What the pointer is over in SSD decoration space.
@@ -23,29 +25,57 @@ pub enum DecorationHit {
 
 impl WindowDecoration {
     pub fn new(width: i32, focused: bool, config: &DecorationConfig) -> Self {
-        let title_bar = render_title_bar(width, focused, false, config);
+        // Placeholder scale + empty title; the first-frame `update()` re-renders
+        // at the real output scale and window title.
+        let scale = 1;
+        let title_bar = render_title_bar(width, focused, false, scale, "", config);
         Self {
             title_bar,
             width,
             focused,
             close_hovered: false,
+            scale,
+            title: String::new(),
         }
     }
 
-    /// Re-render if width or focus changed. Returns true if buffer was rebuilt.
-    pub fn update(&mut self, width: i32, focused: bool, config: &DecorationConfig) -> bool {
-        if width == self.width && focused == self.focused {
+    /// Re-render if width, focus, scale, or title changed. Returns true if rebuilt.
+    pub fn update(
+        &mut self,
+        width: i32,
+        focused: bool,
+        scale: i32,
+        title: &str,
+        config: &DecorationConfig,
+    ) -> bool {
+        if width == self.width
+            && focused == self.focused
+            && scale == self.scale
+            && title == self.title
+        {
             return false;
         }
         self.width = width;
         self.focused = focused;
-        self.title_bar = render_title_bar(width, focused, self.close_hovered, config);
+        self.scale = scale;
+        self.title.clear();
+        self.title.push_str(title);
+        self.title_bar =
+            render_title_bar(width, focused, self.close_hovered, scale, &self.title, config);
         true
     }
 }
 
 /// Right padding so the close button doesn't sit flush with the title bar edge.
 const CLOSE_BTN_RIGHT_PAD: i32 = 8;
+/// Gap between the title text and the close button (logical px).
+const TITLE_TEXT_GAP: i32 = 6;
+/// Points-to-logical-pixels factor (96 dpi reference). `font_size` is
+/// configured in points to match GTK/pango font specs.
+const PT_TO_PX: f32 = 4.0 / 3.0;
+/// Close-button × stroke width as a fraction of the title bar height
+/// (~1.25px at the default 25px bar). Scales with bar height and output scale.
+const CLOSE_BTN_STROKE: f64 = 0.05;
 
 /// Close button hit area: a square on the right side of the title bar.
 pub fn close_button_rect(
@@ -140,18 +170,26 @@ pub fn resize_edge_at(
     })
 }
 
-/// CPU-render the title bar: solid background with rounded top corners + "×" close button.
+/// CPU-render the title bar: solid background, rounded top corners, title text,
+/// and a "×" close button. `scale` supersamples the buffer (buffer scale =
+/// `scale`) so the bar stays crisp on HiDPI outputs; all buffer-space geometry
+/// below is in physical pixels.
 pub fn render_title_bar(
     width: i32,
     _focused: bool,
     _close_hovered: bool,
+    scale: i32,
+    title: &str,
     config: &DecorationConfig,
 ) -> MemoryRenderBuffer {
-    let h = DecorationConfig::TITLE_BAR_HEIGHT;
-    let w = width.max(1);
+    let s = scale.max(1);
+    let h = config.title_bar_height * s;
+    let w = width.max(1) * s;
     let bg = config.bg_color;
     let fg = config.fg_color;
-    let cr = (config.corner_radius as f64).min(w as f64 / 2.0).min(h as f64);
+    let cr = ((config.corner_radius * s) as f64)
+        .min(w as f64 / 2.0)
+        .min(h as f64);
 
     let mut pixels = vec![0u8; (w * h * 4) as usize];
 
@@ -172,21 +210,55 @@ pub fn render_title_bar(
 
     // Draw "×" close button: two crossed lines, inset from the right edge
     let btn_size = h;
-    let btn_x = w - btn_size - CLOSE_BTN_RIGHT_PAD;
+    let btn_x = w - btn_size - CLOSE_BTN_RIGHT_PAD * s;
     let margin = (btn_size as f64 * 0.37).round() as i32;
     let x0 = btn_x + margin;
     let y0 = margin;
     let x1 = btn_x + btn_size - margin;
     let y1 = h - margin;
 
-    draw_line(&mut pixels, w, x0, y0, x1, y1, fg);
-    draw_line(&mut pixels, w, x0, y1, x1, y0, fg);
+    let line_w = btn_size as f64 * CLOSE_BTN_STROKE;
+    draw_line(&mut pixels, w, x0, y0, x1, y1, fg, line_w);
+    draw_line(&mut pixels, w, x0, y1, x1, y0, fg, line_w);
+
+    // Draw the window title text in the space left of the close button.
+    // The left inset matches the close button's effective right inset — its
+    // edge padding plus the × glyph's margin inside the button — so the bar
+    // looks symmetric.
+    let left_pad = CLOSE_BTN_RIGHT_PAD * s + margin;
+    let right_limit = btn_x - TITLE_TEXT_GAP * s;
+    let available = right_limit - left_pad;
+    if available > 0 && !title.is_empty() {
+        // `font_size` is in points; convert to logical px (96 dpi) then to
+        // buffer px. Not clamped — vertical centering plus the buffer bounds
+        // absorb an oversized font.
+        let font_px = (config.font_size as f32 * PT_TO_PX * s as f32).max(1.0);
+        let (text, text_w) =
+            driftwm::text::fit_text(title, &config.font, font_px, config.font_weight, available);
+        let origin_x = match config.title_align {
+            TitleAlign::Left => left_pad,
+            // Centered in the full bar, clamped clear of the close button and
+            // the left padding (long titles end up left-aligned + ellipsized).
+            TitleAlign::Center => ((w - text_w) / 2).min(right_limit - text_w).max(left_pad),
+        };
+        driftwm::text::rasterize_into(
+            &mut pixels,
+            w,
+            h,
+            &text,
+            &config.font,
+            font_px,
+            config.font_weight,
+            fg,
+            origin_x,
+        );
+    }
 
     MemoryRenderBuffer::from_slice(
         &pixels,
         Fourcc::Abgr8888,
         (w, h),
-        1,
+        s,
         Transform::Normal,
         None,
     )
@@ -221,11 +293,22 @@ fn corner_alpha_at(x: i32, y: i32, w: i32, r: f64) -> f64 {
 }
 
 /// Draw an anti-aliased line using distance-from-line rasterization.
-fn draw_line(pixels: &mut [u8], stride: i32, x0: i32, y0: i32, x1: i32, y1: i32, color: [u8; 4]) {
-    let min_x = x0.min(x1) - 1;
-    let max_x = x0.max(x1) + 1;
-    let min_y = y0.min(y1) - 1;
-    let max_y = y0.max(y1) + 1;
+#[allow(clippy::too_many_arguments)]
+fn draw_line(
+    pixels: &mut [u8],
+    stride: i32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    color: [u8; 4],
+    line_width: f64,
+) {
+    let pad = (line_width * 0.5 + 1.0).ceil() as i32;
+    let min_x = x0.min(x1) - pad;
+    let max_x = x0.max(x1) + pad;
+    let min_y = y0.min(y1) - pad;
+    let max_y = y0.max(y1) + pad;
 
     let dx = (x1 - x0) as f64;
     let dy = (y1 - y0) as f64;
@@ -233,8 +316,6 @@ fn draw_line(pixels: &mut [u8], stride: i32, x0: i32, y0: i32, x1: i32, y1: i32,
     if len < 0.001 {
         return;
     }
-
-    let line_width = 0.8;
 
     for py in min_y..=max_y {
         for px in min_x..=max_x {

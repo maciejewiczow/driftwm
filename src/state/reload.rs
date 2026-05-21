@@ -155,7 +155,15 @@ impl DriftWm {
 
         self.config = new_config;
 
+        // Force every SSD title bar to re-render with the new decoration config
+        // (font, height, colors). `update()` only rebuilds the buffer when its
+        // cached width/focus/scale differ, so invalidate the cached width.
+        for deco in self.decorations.values_mut() {
+            deco.width = -1;
+        }
+
         self.apply_output_rules_after_reload();
+        self.recompute_decoration_scale();
 
         self.mark_all_dirty();
         tracing::info!("Config reloaded");

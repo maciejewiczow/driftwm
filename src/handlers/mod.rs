@@ -920,6 +920,7 @@ impl OutputManagementHandler for DriftWm {
 
             self.render.remove_output(&s.output_name);
         }
+        self.recompute_decoration_scale();
         self.mark_all_dirty();
         self.output_config_dirty = true;
         true

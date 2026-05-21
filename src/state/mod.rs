@@ -348,6 +348,10 @@ pub struct DriftWm {
         crate::decorations::WindowDecoration,
     >,
     pub pending_ssd: HashSet<smithay::reexports::wayland_server::backend::ObjectId>,
+    /// Supersample factor for SSD decoration buffers: `ceil` of the largest
+    /// output scale. One buffer rendered at this density serves every output
+    /// (downscaling stays crisp; only upscaling blurs).
+    pub decoration_scale: i32,
     // -- global: render state (shaders, blur, backgrounds, captures) --
     pub render: RenderCache,
 
@@ -1130,7 +1134,19 @@ impl DriftWm {
         window
             .wl_surface()
             .filter(|s| self.decorations.contains_key(&s.id()))
-            .map_or(0, |_| driftwm::config::DecorationConfig::TITLE_BAR_HEIGHT)
+            .map_or(0, |_| self.config.decorations.title_bar_height)
+    }
+
+    /// Recompute `decoration_scale` from the current outputs. Call after any
+    /// output add/remove/scale change so SSD buffers re-render at the right
+    /// pixel density on the next frame.
+    pub fn recompute_decoration_scale(&mut self) {
+        let max_scale = self
+            .space
+            .outputs()
+            .map(|o| o.current_scale().fractional_scale())
+            .fold(1.0_f64, f64::max);
+        self.decoration_scale = max_scale.ceil() as i32;
     }
 
     /// Effective border width for a window, resolving per-window rule
@@ -1334,7 +1350,7 @@ impl DriftWm {
     /// Offset a spawn position so it doesn't overlap an existing window.
     /// Walks in diagonal steps (title bar height) until no window is within a few pixels.
     pub fn cascade_position(&self, mut pos: (i32, i32), skip: &Window) -> (i32, i32) {
-        let step = driftwm::config::DecorationConfig::TITLE_BAR_HEIGHT;
+        let step = self.config.decorations.title_bar_height;
         loop {
             let dominated = self.space.elements().any(|w| {
                 w != skip

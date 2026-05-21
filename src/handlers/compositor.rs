@@ -375,7 +375,7 @@ impl CompositorHandler for DriftWm {
                             // both placement paths need it to center the visible
                             // frame (titlebar + content) on the target point.
                             let bar_px = if matches!(effective, driftwm::config::DecorationMode::Server) {
-                                driftwm::config::DecorationConfig::TITLE_BAR_HEIGHT
+                                self.config.decorations.title_bar_height
                             } else {
                                 0
                             };

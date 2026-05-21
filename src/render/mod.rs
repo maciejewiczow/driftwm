@@ -46,6 +46,7 @@ use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 
 use driftwm::canvas;
+use driftwm::window_ext::WindowExt;
 
 /// Build render elements for a locked session: only the lock surface.
 /// No compositor cursor — the lock client manages its own visuals.
@@ -249,7 +250,7 @@ pub fn compose_frame(
         bbox.loc += loc - geom_loc;
         if has_ssd {
             let r = driftwm::config::DecorationConfig::SHADOW_RADIUS.ceil() as i32;
-            let bar = driftwm::config::DecorationConfig::TITLE_BAR_HEIGHT;
+            let bar = state.config.decorations.title_bar_height;
             bbox.loc.x -= r;
             bbox.loc.y -= bar + r;
             bbox.size.w += 2 * r;
@@ -314,11 +315,22 @@ pub fn compose_frame(
         push_plain_elements(target, popup_elems, zoom);
 
         if has_ssd {
-            let bar_height = driftwm::config::DecorationConfig::TITLE_BAR_HEIGHT;
+            let bar_height = state.config.decorations.title_bar_height;
 
-            // Update decoration state (re-render title bar if needed)
+            // Update decoration state (re-render title bar if needed).
+            // Title falls back to app_id, then blank.
+            let deco_title = window
+                .window_title()
+                .or_else(|| window.app_id_or_class())
+                .unwrap_or_default();
             if let Some(deco) = state.decorations.get_mut(&wl_surface.id()) {
-                deco.update(geom_size.w, is_focused, &state.config.decorations);
+                deco.update(
+                    geom_size.w,
+                    is_focused,
+                    state.decoration_scale,
+                    &deco_title,
+                    &state.config.decorations,
+                );
             }
 
             // Title bar element: positioned above the window
@@ -524,7 +536,7 @@ pub fn compose_frame(
                 (render_loc.y * zoom) as i32,
             ));
             let screen_size: Size<i32, Logical> = if has_ssd {
-                let bar = driftwm::config::DecorationConfig::TITLE_BAR_HEIGHT;
+                let bar = state.config.decorations.title_bar_height;
                 (
                     (geom_size.w as f64 * zoom).ceil() as i32,
                     ((geom_size.h + bar) as f64 * zoom).ceil() as i32,
@@ -539,7 +551,8 @@ pub fn compose_frame(
                 if has_ssd {
                     Point::from((
                         screen_loc.x,
-                        screen_loc.y - (driftwm::config::DecorationConfig::TITLE_BAR_HEIGHT as f64 * zoom) as i32,
+                        screen_loc.y
+                            - (state.config.decorations.title_bar_height as f64 * zoom) as i32,
                     ))
                 } else {
                     // CSD windows: geometry starts at render_loc + geo.loc, not at render_loc
@@ -562,7 +575,7 @@ pub fn compose_frame(
                 let rects = client_blur_rects.as_ref().unwrap();
                 let composite_scale = zoom * output_scale;
                 let (offset_x, offset_y): (f64, f64) = if has_ssd {
-                    (0.0, driftwm::config::DecorationConfig::TITLE_BAR_HEIGHT as f64)
+                    (0.0, state.config.decorations.title_bar_height as f64)
                 } else {
                     let geo = window.geometry();
                     (-geo.loc.x as f64, -geo.loc.y as f64)

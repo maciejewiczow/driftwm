@@ -420,6 +420,30 @@ pub enum DecorationMode {
     None,
 }
 
+/// Font weight for SSD title bar text. The renderer asks fontconfig for the
+/// nearest weight the chosen family actually ships.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FontWeight {
+    Thin,
+    ExtraLight,
+    Light,
+    Normal,
+    #[default]
+    Medium,
+    SemiBold,
+    Bold,
+    ExtraBold,
+    Black,
+}
+
+/// Horizontal placement of SSD title bar text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TitleAlign {
+    Left,
+    #[default]
+    Center,
+}
+
 // ── Window-rule pattern matching ────────────────────────────────────
 
 /// A match pattern for a window rule field.
@@ -709,7 +733,6 @@ pub fn applied_rule(
 }
 
 /// Server-side decoration configuration.
-/// Only colors are user-configurable — everything else is hardcoded.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecorationConfig {
     pub bg_color: [u8; 4],
@@ -724,6 +747,14 @@ pub struct DecorationConfig {
     pub border_color_focused: [u8; 4],
     /// Global drop-shadow toggle. Per-window `shadow` rules override this.
     pub shadow: bool,
+    /// SSD title bar height in logical pixels.
+    pub title_bar_height: i32,
+    /// Font family for the SSD title text (resolved via fontconfig).
+    pub font: String,
+    /// Title text size in points (96 dpi reference, like GTK/pango).
+    pub font_size: u32,
+    pub font_weight: FontWeight,
+    pub title_align: TitleAlign,
 }
 
 impl Default for DecorationConfig {
@@ -737,6 +768,11 @@ impl Default for DecorationConfig {
             border_color: [0x30, 0x30, 0x30, 0xFF],
             border_color_focused: [0x30, 0x30, 0x30, 0xFF],
             shadow: true,
+            title_bar_height: 25,
+            font: "Adwaita Sans".to_string(),
+            font_size: 11,
+            font_weight: FontWeight::Medium,
+            title_align: TitleAlign::Center,
         }
     }
 }
@@ -813,7 +849,6 @@ pub fn effective_shadow_enabled(
 }
 
 impl DecorationConfig {
-    pub const TITLE_BAR_HEIGHT: i32 = 25;
     pub const SHADOW_RADIUS: f32 = 14.0;
     pub const SHADOW_COLOR: [u8; 4] = [0x00, 0x00, 0x00, 0x66];
     pub const RESIZE_BORDER_WIDTH: i32 = 8;

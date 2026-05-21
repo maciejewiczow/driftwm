@@ -1089,6 +1089,7 @@ fn create_surface(
     state
         .space
         .map_output(&output, effective_camera.to_i32_round());
+    state.recompute_decoration_scale();
 
     Some(SurfaceData {
         compositor,
@@ -1180,6 +1181,7 @@ fn teardown_output(data: &mut DriftWm, surface: SurfaceData, is_last: bool) {
         data.disconnected_outputs.insert(output.name());
     } else {
         data.space.unmap_output(&output);
+        data.recompute_decoration_scale();
         data.fullscreen.remove(&output);
         data.dpms_off_outputs.remove(&output);
         data.pending_dpms.remove(&output);

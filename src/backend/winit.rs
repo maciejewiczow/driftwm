@@ -145,6 +145,7 @@ pub fn init_winit(
                         Some(smithay::output::Scale::Fractional(scale_factor)),
                         None,
                     );
+                    data.recompute_decoration_scale();
                 }
                 WinitEvent::Input(event) => {
                     data.process_input_event(event);

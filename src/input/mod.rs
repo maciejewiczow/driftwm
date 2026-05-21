@@ -512,7 +512,7 @@ impl DriftWm {
         pos: Point<f64, smithay::utils::Logical>,
         widget_filter: Option<bool>,
     ) -> Option<(FocusTarget, Point<f64, smithay::utils::Logical>)> {
-        let bar_height = driftwm::config::DecorationConfig::TITLE_BAR_HEIGHT;
+        let bar_height = self.config.decorations.title_bar_height;
         let border_width = driftwm::config::DecorationConfig::RESIZE_BORDER_WIDTH;
 
         for window in self.space.elements().rev() {
@@ -614,7 +614,7 @@ impl DriftWm {
         {
             deco.close_hovered = hovered;
             deco.title_bar = crate::decorations::render_title_bar(
-                deco.width, deco.focused, hovered, &self.config.decorations,
+                deco.width, deco.focused, hovered, deco.scale, &deco.title, &self.config.decorations,
             );
         }
     }
@@ -625,7 +625,7 @@ impl DriftWm {
             if deco.close_hovered {
                 deco.close_hovered = false;
                 deco.title_bar = crate::decorations::render_title_bar(
-                    deco.width, deco.focused, false, &self.config.decorations,
+                    deco.width, deco.focused, false, deco.scale, &deco.title, &self.config.decorations,
                 );
             }
         }
@@ -637,7 +637,7 @@ impl DriftWm {
         &self,
         pos: Point<f64, smithay::utils::Logical>,
     ) -> Option<(Window, DecorationHit)> {
-        let bar_height = driftwm::config::DecorationConfig::TITLE_BAR_HEIGHT;
+        let bar_height = self.config.decorations.title_bar_height;
         let border_width = driftwm::config::DecorationConfig::RESIZE_BORDER_WIDTH;
 
         // Iterate in z-order (topmost first, matching space.elements().rev())
