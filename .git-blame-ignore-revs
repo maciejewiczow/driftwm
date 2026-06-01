@@ -1,0 +1,6 @@
+# Commits to skip in `git blame` (mechanical reformats, no logic changes).
+# GitHub honors this file automatically. Enable it locally with:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# Apply cargo fmt across the codebase
+f16c2e0d246cbb6776cf9040eb8b9ef9a68820c6

@@ -18,6 +18,7 @@ Actively developed and released (currently v0.8.x) — a public, multi-contribut
 - Comments explain *why*, not *what*. Don't restate what the code does.
 - Brief doc comments (`///`) on public functions are fine when the signature isn't self-explanatory.
 - Inline comments for non-obvious logic (smithay quirks, coordinate space tricks) are good.
+- Formatting is automated: run `cargo fmt` (rustfmt stable defaults, no `rustfmt.toml`). CI gates on `cargo fmt --check`.
 
 ## Build & Run
 
@@ -28,6 +29,7 @@ cargo run -- --backend udev   # run on real hardware (from TTY)
 cargo test               # run tests
 cargo test test_name     # run a single test
 cargo clippy             # lint
+cargo fmt                # format (CI runs cargo fmt --check)
 ```
 
 Use `RUST_LOG=debug cargo run` for smithay/libinput event traces.
