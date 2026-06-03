@@ -274,8 +274,8 @@ To uninstall, run `sudo make uninstall` from the repository.
 driftwm runs standalone — none of these are required — but each enables or
 improves a feature:
 
-- `xwayland-satellite` (>= 0.7) — X11 app support (see below).
-- `xdg-desktop-portal` + `xdg-desktop-portal-wlr` (or `xdg-desktop-portal-cosmic`) — screencasting.
+- `xwayland-satellite` (≥ 0.7) — X11 app support (see below).
+- `xdg-desktop-portal` + `xdg-desktop-portal-wlr` (≥ 0.8.0) or `xdg-desktop-portal-cosmic` — screencasting. wlr needs a dmenu-style picker in `$PATH` (`wmenu`/`wofi`/`rofi`/`bemenu`/`mew`/`fuzzel`) to choose what to share.
 - `grim` + `slurp` — screenshots (+ cropping to region).
 - `adwaita-fonts` — renders SSD title bars in `Adwaita Sans` to match GTK apps; without it a generic sans-serif is substituted. Font, size, weight, and alignment are configurable under `[decorations]`.
 - A cursor theme — most desktops set one up already; on a bare install driftwm falls back to a basic built-in arrow.
