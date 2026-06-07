@@ -68,6 +68,7 @@ impl DriftWm {
                     !w.wl_surface()
                         .and_then(|s| driftwm::config::applied_rule(&s))
                         .is_some_and(|r| r.widget)
+                        && !self.is_pinned(w)
                 })
                 .map(|w| {
                     let loc = self.space.element_location(w).unwrap_or_default();
@@ -89,10 +90,13 @@ impl DriftWm {
             .find(|w| focus_belongs_to_window(surface, w))
             .cloned();
         if let Some(window) = window {
+            // Widgets and pinned (PiP-style) windows stay out of the focus
+            // cycle / alt-tab history.
             if window
                 .wl_surface()
                 .and_then(|s| driftwm::config::applied_rule(&s))
                 .is_some_and(|r| r.widget)
+                || self.is_pinned(&window)
             {
                 return;
             }

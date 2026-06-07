@@ -74,9 +74,10 @@ differently — see [Layer-shell surfaces](#layer-shell-surfaces) below.
 
 | Field                  | Type                     | Default   | Description                                                                                                                                              |
 | ---------------------- | ------------------------ | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `position`             | `[x, y]`                 | —         | Place window at canvas coordinates (window center, Y-up)                                                                                                 |
+| `position`             | `[x, y]`                 | —         | Place window at canvas coordinates (window center, Y-up). Output-relative (origin = output center) when `pinned_to_screen` is set.                       |
 | `size`                 | `[w, h]`                 | —         | Initial window dimensions in pixels (one-shot: the user/app can resize freely afterwards; pair with `widget = true` to keep the size locked)             |
 | `widget`               | `bool`                   | `false`   | Pin window: immovable, below normal windows, excluded from navigation/alt-tab                                                                            |
+| `pinned_to_screen`     | `bool`                   | `false`   | Pin to one output's screen space — see [Screen-pinned windows](#screen-pinned-windows)                                                                   |
 | `decoration`           | string                   | inherited | Override decoration mode (see below)                                                                                                                     |
 | `blur`                 | `bool`                   | `false`   | Blur compositor background behind this window                                                                                                            |
 | `opacity`              | `0.0`–`1.0`              | `1.0`     | Window transparency (1.0 = fully opaque)                                                                                                                 |
@@ -95,6 +96,37 @@ differently — see [Layer-shell surfaces](#layer-shell-surfaces) below.
 | `"server"`     | SSD — driftwm draws a titlebar with the window title and a close button                                  |
 | `"minimal"`    | SSD — no titlebar; shadow, corner clip, and border still apply per `[decorations]` / per-window rules    |
 | `"none"`       | Bare client surface — compositor adds zero chrome; per-window border/corner/shadow rules are ignored too |
+
+### Screen-pinned windows
+
+`pinned_to_screen = true` lifts a window out of the infinite canvas and fixes it
+to one output's **screen space**: it does not pan or zoom with the camera, and it
+renders **above** normal windows (but below panels / Top & Overlay layer-shell
+surfaces). Use it for Picture-in-Picture, video-call toolbars, or any always-on
+floating overlay.
+
+- **Coordinates are output-relative.** When pinned, `position` is measured from
+  the **output center** (still center-anchored and Y-up): `[0, 0]` centers the
+  window on the monitor, `+Y` is up. Drop `position` to center it.
+- **Movable and resizable** like a normal window — drag the title bar (or
+  `Mod`-drag) to move, drag a border to resize. Dragging across monitors
+  reassigns it to that output. Combine with `widget = true` to make it
+  **immovable**.
+- **No fullscreen.** Fullscreen requests on a pinned window are refused.
+- **Off the canvas.** Pinned windows are excluded from navigation, alt-tab,
+  snapping, fit/center actions, and canvas screenshots (`driftwm msg
+  screenshot`). They remain focusable and closable; SSD windows show a small dot
+  in the title bar.
+- **Toggle at runtime** with the `toggle-pin-to-screen` action (bound to `Mod+T`
+  by default), which pins/unpins the focused window in place.
+
+```toml
+# Firefox Picture-in-Picture, pinned 300px below the output center.
+[[window_rules]]
+title            = "Picture-in-Picture"
+pinned_to_screen = true
+position         = [0, -300]
+```
 
 ### Layer-shell surfaces
 

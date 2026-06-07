@@ -144,7 +144,7 @@ impl DriftWm {
         let Some(wl_surface) = window.wl_surface() else {
             return;
         };
-        if config::applied_rule(&wl_surface).is_some_and(|r| r.widget) {
+        if self.is_pinned(window) || config::applied_rule(&wl_surface).is_some_and(|r| r.widget) {
             return;
         }
 
@@ -312,7 +312,7 @@ impl DriftWm {
         let Some(wl_surface) = window.wl_surface() else {
             return;
         };
-        if config::applied_rule(&wl_surface).is_some_and(|r| r.widget) {
+        if self.is_pinned(window) || config::applied_rule(&wl_surface).is_some_and(|r| r.widget) {
             return;
         }
         let Some(old_loc) = self.space.element_location(window) else {

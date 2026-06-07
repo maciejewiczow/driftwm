@@ -209,6 +209,7 @@ pub(super) fn parse_window_rule(r: WindowRuleFile, mod_key: ModKey) -> Option<Wi
             }
         }),
         widget: r.widget,
+        pinned_to_screen: r.pinned_to_screen,
         decoration,
         blur: r.blur.unwrap_or(false),
         opacity: r.opacity.map(|v| {

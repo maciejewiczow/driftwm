@@ -148,6 +148,14 @@ impl XdgShellHandler for DriftWm {
         _output: Option<wl_output::WlOutput>,
     ) {
         let wl_surface = surface.wl_surface().clone();
+        // Pinned windows never fullscreen (decision). Refuse the already-pinned
+        // case early; the deferred path below is also covered because its drain
+        // calls the guarded `enter_fullscreen`.
+        if self.pinned.contains_key(&wl_surface.id())
+            || driftwm::config::applied_rule(&wl_surface).is_some_and(|r| r.pinned_to_screen)
+        {
+            return;
+        }
         // Defer until the first sized commit — geometry is still (0,0)
         // here, which would poison `saved_size`, and the initial-commit
         // positioning block would clobber the fullscreen map.
@@ -216,6 +224,7 @@ impl XdgShellHandler for DriftWm {
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let wl_surface = surface.wl_surface().clone();
         self.decorations.remove(&wl_surface.id());
+        self.pinned.remove(&wl_surface.id());
         self.render.shadow_cache.remove(&wl_surface.id());
         self.render.border_cache.remove(&wl_surface.id());
         self.pending_ssd.remove(&wl_surface.id());
@@ -378,6 +387,20 @@ impl XdgShellHandler for DriftWm {
             return;
         };
 
+        // Pinned windows move in screen space. A canvas grab would only shuffle
+        // the loc-synced canvas position while the window keeps rendering at its
+        // fixed `screen_pos` — i.e. the CSD titlebar drag would do nothing.
+        if self.pinned.contains_key(&wl_surface.id()) {
+            self.start_pinned_move(
+                &pointer,
+                &window,
+                start_data.location,
+                start_data.button,
+                serial,
+            );
+            return;
+        }
+
         // Client-initiated xdg move_request: the client asked to move itself,
         // not its cluster neighbors. Clients don't know about clusters, so
         // always single-window.
@@ -438,6 +461,10 @@ impl XdgShellHandler for DriftWm {
         // Clear fit state — user took manual control
         crate::state::fit::clear_fit_state(&wl_surface);
 
+        // Pinned windows resize in screen space (see start_compositor_resize_with_edge).
+        let pinned_initial_screen_pos = self.pinned.get(&wl_surface.id()).map(|p| p.screen_pos);
+        let pinned_output = self.pinned.get(&wl_surface.id()).map(|p| p.output.clone());
+
         // Store resize state in the surface data map for commit() repositioning
         with_states(&wl_surface, |states| {
             states
@@ -447,6 +474,7 @@ impl XdgShellHandler for DriftWm {
                     edges,
                     initial_window_location,
                     initial_window_size,
+                    initial_screen_pos: pinned_initial_screen_pos,
                 });
         });
 
@@ -461,11 +489,12 @@ impl XdgShellHandler for DriftWm {
         // CSD windows trigger resize through xdg_toplevel.resize() when
         // the user drags the client-drawn border. Honor the config flag so
         // edge-drag propagation behaves identically for SSD and CSD windows.
-        let cluster_resize = if self.config.decoration_resize_snapped {
-            self.cluster_snapshot_for_resize(&window, edges)
-        } else {
-            crate::state::ClusterResizeSnapshot::empty()
-        };
+        let cluster_resize =
+            if self.config.decoration_resize_snapped && pinned_initial_screen_pos.is_none() {
+                self.cluster_snapshot_for_resize(&window, edges)
+            } else {
+                crate::state::ClusterResizeSnapshot::empty()
+            };
         let constraints = crate::grabs::SizeConstraints::for_window(&window);
         let grab = ResizeSurfaceGrab {
             start_data,
@@ -474,11 +503,12 @@ impl XdgShellHandler for DriftWm {
             initial_window_location,
             initial_window_size,
             last_window_size: initial_window_size,
-            output,
+            output: pinned_output.unwrap_or(output),
             last_clamped_location,
             snap: driftwm::layout::snap::SnapState::default(),
             constraints,
             cluster_resize,
+            pinned_initial_screen_pos,
         };
         pointer.set_grab(self, grab, serial, Focus::Clear);
     }

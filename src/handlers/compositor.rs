@@ -2,10 +2,10 @@ use std::cell::RefCell;
 
 use crate::grabs::{ResizeState, has_left, has_top};
 use crate::handlers::layer_shell::LayerDestroyedMarker;
-use crate::state::{ClientState, DriftWm, FocusTarget, PendingRecenter};
+use crate::state::{ClientState, DriftWm, FocusTarget, PendingRecenter, PinnedState};
 use driftwm::window_ext::WindowExt;
 use smithay::desktop::layer_map_for_output;
-use smithay::utils::Rectangle;
+use smithay::utils::{Logical, Point, Rectangle};
 use smithay::wayland::shell::wlr_layer::{
     Anchor, KeyboardInteractivity, LayerSurfaceCachedState, LayerSurfaceData,
 };
@@ -49,6 +49,7 @@ impl CompositorHandler for DriftWm {
         // shutdown, but a client crash destroys wl_surface without it.
         let id = surface.id();
         self.decorations.remove(&id);
+        self.pinned.remove(&id);
         self.pending_ssd.remove(&id);
         self.pending_recenter.remove(&id);
         self.auto_anchor_snapshot.remove(surface);
@@ -350,6 +351,37 @@ impl CompositorHandler for DriftWm {
                         } else {
                             self.pending_size.remove(&root);
                         }
+                    } else if applied.as_ref().is_some_and(|a| a.pinned_to_screen)
+                        && has_size
+                        && !is_fullscreen
+                        && let Some(output) = self.active_output()
+                    {
+                        // Screen-pinned: live in the active output's screen
+                        // space, not the canvas. `position` (if any) is the
+                        // output-relative center, Y-up (output center = origin).
+                        let (rx, ry) = applied.as_ref().and_then(|a| a.position).unwrap_or((0, 0));
+                        let out_size = crate::state::output_logical_size(&output);
+                        let internal = driftwm::canvas::rule_to_internal(rx, ry, geo.size);
+                        let screen_pos: Point<i32, Logical> =
+                            (out_size.w / 2 + internal.x, out_size.h / 2 + internal.y).into();
+                        // Seed the Space loc to the canvas point this screen
+                        // position currently maps to; the per-frame loc-sync
+                        // keeps it correct as the camera moves.
+                        let (camera, zoom) = {
+                            let os = crate::state::output_state(&output);
+                            (os.camera, os.zoom)
+                        };
+                        let canvas = driftwm::canvas::screen_to_canvas(
+                            driftwm::canvas::ScreenPos(screen_pos.to_f64()),
+                            camera,
+                            zoom,
+                        )
+                        .0
+                        .to_i32_round();
+                        let activate = applied.as_ref().is_none_or(|a| !a.widget);
+                        self.pinned
+                            .insert(root.id(), PinnedState { output, screen_pos });
+                        self.space.map_element(window.clone(), canvas, activate);
                     } else if has_size && !is_fullscreen && !crate::state::fit::is_fit(&window) {
                         // Fullscreen / fit windows already sit at their final
                         // location — skip positioning so bar-shifted
@@ -499,10 +531,15 @@ impl CompositorHandler for DriftWm {
 
                         let is_widget = applied.as_ref().is_some_and(|a| a.widget);
                         // Deferred fit/fullscreen will override camera/zoom/raise
-                        // /focus — skip navigate_to_window then.
+                        // /focus — skip navigate_to_window then. Pinned windows
+                        // have no canvas position to navigate the camera to.
                         let deferred_fit_or_fs = self.pending_fit.contains(&root)
                             || self.pending_fullscreen.contains(&root);
-                        if !is_widget && !is_fullscreen && !deferred_fit_or_fs {
+                        if !is_widget
+                            && !is_fullscreen
+                            && !deferred_fit_or_fs
+                            && !self.pinned.contains_key(&root.id())
+                        {
                             let reset = self.config.zoom_reset_on_new_window;
                             // Cursor mode is "stay put" by default; only
                             // override in the overview-rescue case (user is
@@ -762,32 +799,72 @@ impl DriftWm {
                 .borrow()
         });
 
-        let (edges, initial_window_location, initial_window_size) = match resize_state {
-            ResizeState::Resizing {
-                edges,
-                initial_window_location,
-                initial_window_size,
-            }
-            | ResizeState::WaitingForLastCommit {
-                edges,
-                initial_window_location,
-                initial_window_size,
-            } => (edges, initial_window_location, initial_window_size),
-            ResizeState::Idle => return,
-        };
+        let (edges, initial_window_location, initial_window_size, initial_screen_pos) =
+            match resize_state {
+                ResizeState::Resizing {
+                    edges,
+                    initial_window_location,
+                    initial_window_size,
+                    initial_screen_pos,
+                }
+                | ResizeState::WaitingForLastCommit {
+                    edges,
+                    initial_window_location,
+                    initial_window_size,
+                    initial_screen_pos,
+                } => (
+                    edges,
+                    initial_window_location,
+                    initial_window_size,
+                    initial_screen_pos,
+                ),
+                ResizeState::Idle => return,
+            };
 
         let current_geo = window.geometry();
-        let mut new_loc = initial_window_location;
 
-        // Compute from initial location to avoid cumulative drift.
-        if has_top(edges) {
-            new_loc.y = initial_window_location.y + (initial_window_size.h - current_geo.size.h);
+        // Compute from initial position to avoid cumulative drift.
+        if let Some(initial_screen_pos) = initial_screen_pos {
+            // Pinned: top/left-edge resize moves `screen_pos` so the opposite
+            // edge stays fixed. The Space loc is re-synced here directly because
+            // the per-frame loc-sync only fires on camera changes.
+            let mut new_sp = initial_screen_pos;
+            if has_top(edges) {
+                new_sp.y = initial_screen_pos.y + (initial_window_size.h - current_geo.size.h);
+            }
+            if has_left(edges) {
+                new_sp.x = initial_screen_pos.x + (initial_window_size.w - current_geo.size.w);
+            }
+            let output = self.pinned.get_mut(&surface.id()).map(|p| {
+                p.screen_pos = new_sp;
+                p.output.clone()
+            });
+            if let Some(output) = output {
+                let (camera, zoom) = {
+                    let os = crate::state::output_state(&output);
+                    (os.camera, os.zoom)
+                };
+                let canvas = driftwm::canvas::screen_to_canvas(
+                    driftwm::canvas::ScreenPos(new_sp.to_f64()),
+                    camera,
+                    zoom,
+                )
+                .0
+                .to_i32_round();
+                self.space.map_element(window.clone(), canvas, false);
+            }
+        } else {
+            let mut new_loc = initial_window_location;
+            if has_top(edges) {
+                new_loc.y =
+                    initial_window_location.y + (initial_window_size.h - current_geo.size.h);
+            }
+            if has_left(edges) {
+                new_loc.x =
+                    initial_window_location.x + (initial_window_size.w - current_geo.size.w);
+            }
+            self.space.map_element(window.clone(), new_loc, false);
         }
-        if has_left(edges) {
-            new_loc.x = initial_window_location.x + (initial_window_size.w - current_geo.size.w);
-        }
-
-        self.space.map_element(window.clone(), new_loc, false);
 
         if matches!(resize_state, ResizeState::WaitingForLastCommit { .. }) {
             // Anchor restore_size to the user's final choice so a subsequent

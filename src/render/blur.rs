@@ -251,6 +251,7 @@ fn blur_pass(
 pub(crate) enum BlurLayer {
     Overlay,
     Top,
+    Pinned,
     Normal,
     Widget,
 }
@@ -281,6 +282,7 @@ pub(crate) fn process_blur_requests(
     blur_requests: &[BlurRequestData],
     overlay_prefix: usize,
     top_prefix: usize,
+    pinned_prefix: usize,
     normal_prefix: usize,
     widget_prefix: usize,
 ) {
@@ -324,6 +326,7 @@ pub(crate) fn process_blur_requests(
             let prefix = match req.layer {
                 BlurLayer::Overlay => overlay_prefix,
                 BlurLayer::Top => top_prefix,
+                BlurLayer::Pinned => pinned_prefix,
                 BlurLayer::Normal => normal_prefix,
                 BlurLayer::Widget => widget_prefix,
             };
@@ -360,8 +363,12 @@ pub(crate) fn process_blur_requests(
         );
         let background_changed = cache.last_background_hash != bg_hash;
         let geom_changed = cache.last_geometry_generation != geom_gen;
-        let camera_dirty = matches!(req.layer, BlurLayer::Overlay | BlurLayer::Top)
-            && cache.last_camera_generation != camera_gen;
+        // Pinned windows are screen-fixed like Top/Overlay: the canvas behind
+        // them pans under the camera, so their blur must recompute on camera change.
+        let camera_dirty = matches!(
+            req.layer,
+            BlurLayer::Overlay | BlurLayer::Top | BlurLayer::Pinned
+        ) && cache.last_camera_generation != camera_gen;
 
         if background_changed || geom_changed || camera_dirty || animated_bg {
             cache.dirty = true;
@@ -466,6 +473,7 @@ pub(crate) fn process_blur_requests(
         let prefix = match req.layer {
             BlurLayer::Overlay => overlay_prefix,
             BlurLayer::Top => top_prefix,
+            BlurLayer::Pinned => pinned_prefix,
             BlurLayer::Normal => normal_prefix,
             BlurLayer::Widget => widget_prefix,
         };
@@ -584,6 +592,7 @@ pub(crate) fn process_blur_requests(
         let prefix = match req.layer {
             BlurLayer::Overlay => overlay_prefix,
             BlurLayer::Top => top_prefix,
+            BlurLayer::Pinned => pinned_prefix,
             BlurLayer::Normal => normal_prefix,
             BlurLayer::Widget => widget_prefix,
         };

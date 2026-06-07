@@ -768,6 +768,10 @@ pub fn init_udev(
                                     ) {
                                         surfaces.insert(crtc, sd);
                                         data.active_outputs.insert(surfaces[&crtc].output.clone());
+                                        // Pin any windows orphaned by the virtual-output swap to
+                                        // the freshly connected monitor.
+                                        let new_output = surfaces[&crtc].output.clone();
+                                        data.reassign_orphaned_pinned(&new_output);
                                         let surface = surfaces.get_mut(&crtc).unwrap();
                                         // Notify existing toplevels about the new output
                                         driftwm::protocols::foreign_toplevel::send_output_enter_all(
@@ -1310,6 +1314,11 @@ fn teardown_output(data: &mut DriftWm, surface: SurfaceData, is_last: bool) {
         data.disconnected_outputs.insert(output.name());
     } else {
         data.space.unmap_output(&output);
+        // Reassign screen-pinned windows on the gone output to a survivor.
+        let pin_target = data.space.outputs().next().cloned();
+        if let Some(target) = pin_target {
+            data.reassign_orphaned_pinned(&target);
+        }
         data.recompute_decoration_scale();
         data.fullscreen.remove(&output);
         data.dpms_off_outputs.remove(&output);

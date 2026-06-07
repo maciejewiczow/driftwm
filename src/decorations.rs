@@ -13,6 +13,8 @@ pub struct WindowDecoration {
     pub close_hovered: bool,
     pub scale: i32,
     pub title: String,
+    /// Draw the screen-pinned indicator dot near the left edge.
+    pub pinned: bool,
     /// Font-load state at last render: flips a textless bar to re-render once
     /// the background font scan lands.
     fonts_ready: bool,
@@ -31,7 +33,7 @@ impl WindowDecoration {
         // Placeholder scale + empty title; the first-frame `update()` re-renders
         // at the real output scale and window title.
         let scale = 1;
-        let title_bar = render_title_bar(width, focused, false, scale, "", config);
+        let title_bar = render_title_bar(width, focused, false, scale, "", false, config);
         Self {
             title_bar,
             width,
@@ -39,15 +41,17 @@ impl WindowDecoration {
             close_hovered: false,
             scale,
             title: String::new(),
+            pinned: false,
             fonts_ready: driftwm::text::fonts_ready(),
         }
     }
 
-    /// Re-render if width, focus, scale, or title changed. Returns true if rebuilt.
+    /// Re-render if width, focus, pinned, scale, or title changed. Returns true if rebuilt.
     pub fn update(
         &mut self,
         width: i32,
         focused: bool,
+        pinned: bool,
         scale: i32,
         title: &str,
         config: &DecorationConfig,
@@ -55,6 +59,7 @@ impl WindowDecoration {
         let fonts_ready = driftwm::text::fonts_ready();
         if width == self.width
             && focused == self.focused
+            && pinned == self.pinned
             && scale == self.scale
             && title == self.title
             && fonts_ready == self.fonts_ready
@@ -63,6 +68,7 @@ impl WindowDecoration {
         }
         self.width = width;
         self.focused = focused;
+        self.pinned = pinned;
         self.scale = scale;
         self.fonts_ready = fonts_ready;
         self.title.clear();
@@ -73,6 +79,7 @@ impl WindowDecoration {
             self.close_hovered,
             scale,
             &self.title,
+            self.pinned,
             config,
         );
         true
@@ -193,6 +200,7 @@ pub fn render_title_bar(
     _close_hovered: bool,
     scale: i32,
     title: &str,
+    pinned: bool,
     config: &DecorationConfig,
 ) -> MemoryRenderBuffer {
     let s = scale.max(1);
@@ -238,7 +246,19 @@ pub fn render_title_bar(
     // The left inset matches the close button's effective right inset — its
     // edge padding plus the × glyph's margin inside the button — so the bar
     // looks symmetric.
-    let left_pad = CLOSE_BTN_RIGHT_PAD * s + margin;
+    // Pinned indicator: a small filled dot near the left edge, fg color,
+    // vertically centered. The left-aligned title is then pushed clear of the
+    // dot (diameter + gap) so they don't collide.
+    let base_left_pad = CLOSE_BTN_RIGHT_PAD * s + margin;
+    let left_pad = if pinned {
+        let r = (h as f64 * 0.16).round().max(2.0);
+        let cx = base_left_pad as f64 + r;
+        let cy = h as f64 / 2.0;
+        draw_filled_circle(&mut pixels, w, cx, cy, r, fg);
+        base_left_pad + (2.0 * r).round() as i32 + TITLE_TEXT_GAP * s
+    } else {
+        base_left_pad
+    };
     let right_limit = btn_x - TITLE_TEXT_GAP * s;
     let available = right_limit - left_pad;
     if available > 0 && !title.is_empty() {
@@ -303,6 +323,38 @@ fn corner_alpha_at(x: i32, y: i32, w: i32, r: f64) -> f64 {
         return 1.0 - t * t * (3.0 - 2.0 * t);
     }
     1.0
+}
+
+/// Draw an anti-aliased filled circle, blending `color` over the buffer with a
+/// 1px soft edge. Same straight-alpha blend convention as `draw_line`.
+fn draw_filled_circle(pixels: &mut [u8], stride: i32, cx: f64, cy: f64, r: f64, color: [u8; 4]) {
+    let height = pixels.len() as i32 / (stride * 4);
+    let x_min = (cx - r - 1.0).floor().max(0.0) as i32;
+    let x_max = (cx + r + 1.0).ceil().min(stride as f64) as i32;
+    let y_min = (cy - r - 1.0).floor().max(0.0) as i32;
+    let y_max = (cy + r + 1.0).ceil().min(height as f64) as i32;
+    for py in y_min..y_max {
+        for px in x_min..x_max {
+            let dx = px as f64 + 0.5 - cx;
+            let dy = py as f64 + 0.5 - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let cov = (r + 0.5 - dist).clamp(0.0, 1.0);
+            if cov <= 0.0 {
+                continue;
+            }
+            let idx = ((py * stride + px) * 4) as usize;
+            if idx + 3 >= pixels.len() {
+                continue;
+            }
+            let a = (color[3] as f64 / 255.0 * cov).min(1.0);
+            let inv_a = 1.0 - a;
+            pixels[idx] = (color[0] as f64 * a + pixels[idx] as f64 * inv_a) as u8;
+            pixels[idx + 1] = (color[1] as f64 * a + pixels[idx + 1] as f64 * inv_a) as u8;
+            pixels[idx + 2] = (color[2] as f64 * a + pixels[idx + 2] as f64 * inv_a) as u8;
+            pixels[idx + 3] =
+                (pixels[idx + 3] as f64 + a * 255.0 * (1.0 - pixels[idx + 3] as f64 / 255.0)) as u8;
+        }
+    }
 }
 
 /// Draw an anti-aliased line using distance-from-line rasterization.

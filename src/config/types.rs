@@ -67,6 +67,7 @@ pub enum Action {
     FitWindowSnapped,
     SendToOutput(Direction),
     FocusCenter,
+    TogglePinToScreen,
     SwitchLayout(LayoutSwitch),
     ReloadConfig,
     ToggleCursorPan,
@@ -576,6 +577,10 @@ pub struct WindowRule {
     /// Widget windows are pinned (immovable), excluded from navigation/alt-tab,
     /// and always stacked below normal windows.
     pub widget: bool,
+    /// Pin the window to one output's screen space (ignores pan/zoom, renders
+    /// above normal windows). When set, `position` is output-relative
+    /// (center, Y-up). Combine with `widget = true` to make it immovable.
+    pub pinned_to_screen: bool,
     /// `None` means "inherit `[decorations] default_mode`". Explicit
     /// `decoration = "client"` resolves to `Some(Client)` and overrides default.
     pub decoration: Option<DecorationMode>,
@@ -618,6 +623,7 @@ impl WindowRule {
 #[derive(Clone, Debug)]
 pub struct AppliedWindowRule {
     pub widget: bool,
+    pub pinned_to_screen: bool,
     pub decoration: Option<DecorationMode>,
     pub blur: bool,
     pub opacity: Option<f64>,
@@ -641,6 +647,9 @@ impl AppliedWindowRule {
     pub fn merge_from(&mut self, rule: &WindowRule) {
         if rule.widget {
             self.widget = true;
+        }
+        if rule.pinned_to_screen {
+            self.pinned_to_screen = true;
         }
         if rule.blur {
             self.blur = true;
@@ -680,6 +689,7 @@ impl From<&WindowRule> for AppliedWindowRule {
     fn from(rule: &WindowRule) -> Self {
         Self {
             widget: rule.widget,
+            pinned_to_screen: rule.pinned_to_screen,
             decoration: rule.decoration.clone(),
             blur: rule.blur,
             opacity: rule.opacity,

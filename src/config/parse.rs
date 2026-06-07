@@ -149,6 +149,7 @@ pub fn parse_action(s: &str) -> Result<Action, String> {
             };
             Ok(Action::SwitchLayout(target))
         }
+        "toggle-pin-to-screen" => Ok(Action::TogglePinToScreen),
         "reload-config" => Ok(Action::ReloadConfig),
         "toggle-cursor-pan" => Ok(Action::ToggleCursorPan),
         "quit" => Ok(Action::Quit),
@@ -284,6 +285,7 @@ fn parse_threshold_action(s: &str) -> Result<Option<ThresholdAction>, String> {
         | "toggle-fullscreen"
         | "fit-window"
         | "fit-window-snapped"
+        | "toggle-pin-to-screen"
         | "reload-config"
         | "toggle-cursor-pan"
         | "quit"

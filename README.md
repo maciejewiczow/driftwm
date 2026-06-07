@@ -128,14 +128,15 @@ path = "~/.config/driftwm/bg.glsl"
 
 https://github.com/user-attachments/assets/af603001-9f08-4d42-b50a-0342d06e954b
 
-Match windows by `app_id` and/or `title` (glob patterns) and control
-everything: position, size, decorations, blur, opacity, pass-through keys, and widget behavior. All
-fields are independent and combine freely.
+Match windows by `app_id` and/or `title` (glob patterns) and control position,
+size, decorations, blur, opacity, key pass-through, and placement — fields
+combine freely.
 
-**Widgets**: set `widget = true` to pin a window in place — immovable, below
-normal windows, excluded from Alt-Tab. Works for both regular windows and
-layer-shell surfaces (e.g. waybar). Use this for clocks, system stats, trays, or
-anything you want fixed on the canvas.
+Two special placement modes: **`widget = true`** fixes a window to the canvas
+(immovable, below normal windows, out of Alt-Tab — clocks, trays, and
+layer-shell surfaces like waybar); **`pinned_to_screen = true`** fixes it to the
+screen instead, so it ignores pan/zoom and floats above normal windows
+(Picture-in-Picture, call toolbars) — toggleable live with `Mod+T`.
 
 ```toml
 # Frosted-glass terminal
@@ -144,7 +145,7 @@ app_id = "Alacritty"
 opacity = 0.85
 blur = true
 
-# Desktop widget — pinned, borderless
+# Desktop widget — pinned to the canvas, borderless
 [[window_rules]]
 app_id = "my-clock"
 position = [50, 50]

@@ -267,10 +267,13 @@ pub(crate) fn compose_capture_elements(
             continue;
         }
 
-        let render_loc: Point<f64, Logical> = Point::from((
-            loc.x as f64 - geom_loc.x as f64 - camera.x,
-            loc.y as f64 - geom_loc.y as f64 - camera.y,
-        ));
+        // `output: None` => off-screen canvas capture. Pinned windows return
+        // None here by construction, so a canvas screenshot never includes a
+        // screen-pinned window.
+        let Some((render_loc, _)) = state.window_render_transform(window, None, camera, zoom)
+        else {
+            continue;
+        };
         let loc_phys: Point<i32, Physical> = render_loc.to_physical_precise_round(scale);
 
         let (elems, popup_elems) = if let Some(toplevel) = window.toplevel() {
@@ -563,6 +566,9 @@ pub fn compose_frame(
     // between them. Replicates render_elements_for_region internals.
     let mut zoomed_normal: Vec<OutputRenderElements> = Vec::new();
     let mut zoomed_widgets: Vec<OutputRenderElements> = Vec::new();
+    // Screen-pinned windows: own bucket, rendered above normal and below
+    // Top/Overlay layer-shell (see all_elements assembly below).
+    let mut zoomed_pinned: Vec<OutputRenderElements> = Vec::new();
 
     let blur_enabled = state.render.blur_down_shader.is_some()
         && state.render.blur_up_shader.is_some()
@@ -591,6 +597,7 @@ pub fn compose_frame(
 
         let applied = driftwm::config::applied_rule(&wl_surface);
         let is_widget = applied.as_ref().is_some_and(|r| r.widget);
+        let is_pinned = state.is_pinned(window);
         let is_focused = focused_surface.as_ref().is_some_and(|f| *f == *wl_surface);
         let effective_mode = driftwm::config::effective_decoration_mode(
             applied.as_ref().and_then(|r| r.decoration.as_ref()),
@@ -645,10 +652,15 @@ pub fn compose_frame(
             continue;
         }
 
-        let render_loc: Point<f64, Logical> = Point::from((
-            loc.x as f64 - geom_loc.x as f64 - camera.x,
-            loc.y as f64 - geom_loc.y as f64 - camera.y,
-        ));
+        // Centralized canvas↔screen decision: pinned windows render at their
+        // output-relative `screen_pos` with zoom 1.0 (identity), normal windows
+        // use the camera transform. `zoom` is shadowed so every downstream
+        // scale (clip, border, shadow, blur, rescale) follows automatically.
+        let Some((render_loc, zoom)) =
+            state.window_render_transform(window, Some(output), camera, zoom)
+        else {
+            continue;
+        };
         let client_blur_rects = with_states(&wl_surface, |s| {
             crate::handlers::background_effect::get_cached_blur_region(s)
         });
@@ -699,7 +711,11 @@ pub fn compose_frame(
             (elems, Vec::new())
         };
 
-        let target = if is_widget {
+        // Test `is_pinned` BEFORE `is_widget`: a pinned *widget* must land in the
+        // pinned bucket (above normal), not `zoomed_widgets` (below normal).
+        let target = if is_pinned {
+            &mut zoomed_pinned
+        } else if is_widget {
             &mut zoomed_widgets
         } else {
             &mut zoomed_normal
@@ -723,6 +739,7 @@ pub fn compose_frame(
                 deco.update(
                     geom_size.w,
                     is_focused,
+                    is_pinned,
                     state.decoration_scale,
                     &deco_title,
                     &state.config.decorations,
@@ -1011,7 +1028,9 @@ pub fn compose_frame(
                     screen_rect,
                     elem_start,
                     elem_count,
-                    layer: if is_widget {
+                    layer: if is_pinned {
+                        BlurLayer::Pinned
+                    } else if is_widget {
                         BlurLayer::Widget
                     } else {
                         BlurLayer::Normal
@@ -1111,7 +1130,8 @@ pub fn compose_frame(
     // Prefix offsets locate each group in all_elements for blur insertion.
     let overlay_prefix = cursor_elements.len();
     let top_prefix = overlay_prefix + overlay_elements.len();
-    let normal_prefix = top_prefix + top_elements.len();
+    let pinned_prefix = top_prefix + top_elements.len();
+    let normal_prefix = pinned_prefix + zoomed_pinned.len();
     let widget_prefix = normal_prefix + zoomed_normal.len() + canvas_layer_elements.len();
 
     // Layer surfaces first (front-to-back), then windows.
@@ -1124,6 +1144,7 @@ pub fn compose_frame(
         cursor_elements.len()
             + overlay_elements.len()
             + top_elements.len()
+            + zoomed_pinned.len()
             + zoomed_normal.len()
             + canvas_layer_elements.len()
             + zoomed_widgets.len()
@@ -1136,6 +1157,7 @@ pub fn compose_frame(
     all_elements.extend(cursor_elements);
     all_elements.extend(overlay_elements);
     all_elements.extend(top_elements);
+    all_elements.extend(zoomed_pinned);
     all_elements.extend(zoomed_normal);
     all_elements.extend(canvas_layer_elements);
     all_elements.extend(zoomed_widgets);
@@ -1156,6 +1178,7 @@ pub fn compose_frame(
             &all_blur_requests,
             overlay_prefix,
             top_prefix,
+            pinned_prefix,
             normal_prefix,
             widget_prefix,
         );

@@ -193,6 +193,7 @@ impl DriftWm {
             &self.space,
             &self.decorations,
             &self.config.decorations,
+            &self.pinned,
             primary,
             cluster_excludes,
         )
@@ -203,6 +204,7 @@ impl DriftWm {
     pub fn all_windows_with_snap_rects(&self) -> Vec<(Window, driftwm::layout::snap::SnapRect)> {
         self.space
             .elements()
+            .filter(|w| !self.is_pinned(w))
             .filter_map(|w| {
                 window_snap_rect(&self.space, &self.decorations, &self.config.decorations, w)
                     .map(|(_, rect)| (w.clone(), rect))
@@ -210,8 +212,14 @@ impl DriftWm {
             .collect()
     }
 
-    /// Border + title-bar inflated `SnapRect`. `None` for widgets / unmapped.
+    /// Border + title-bar inflated `SnapRect`. `None` for widgets / pinned /
+    /// unmapped. Pinned windows live in screen space, so they have no canvas
+    /// snap rect — this excludes them from snapping, clustering, and all the
+    /// viewport-relation queries built on top of it.
     pub fn snap_rect_for(&self, w: &Window) -> Option<driftwm::layout::snap::SnapRect> {
+        if self.is_pinned(w) {
+            return None;
+        }
         window_snap_rect(&self.space, &self.decorations, &self.config.decorations, w)
             .map(|(_, r)| r)
     }
@@ -433,6 +441,7 @@ pub(crate) fn snap_targets_impl(
     space: &Space<Window>,
     decorations: &HashMap<smithay::reexports::wayland_server::backend::ObjectId, WindowDecoration>,
     decoration_config: &driftwm::config::DecorationConfig,
+    pinned: &HashMap<smithay::reexports::wayland_server::backend::ObjectId, super::PinnedState>,
     primary: &WlSurface,
     cluster_excludes: &HashSet<WlSurface>,
 ) -> (Vec<driftwm::layout::snap::SnapRect>, i32, i32) {
@@ -457,7 +466,10 @@ pub(crate) fn snap_targets_impl(
         else {
             continue;
         };
-        if surface == *primary || cluster_excludes.contains(&surface) {
+        if surface == *primary
+            || cluster_excludes.contains(&surface)
+            || pinned.contains_key(&surface.id())
+        {
             continue;
         }
         others.push(rect);

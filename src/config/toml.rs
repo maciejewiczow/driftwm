@@ -218,6 +218,11 @@ pub(super) struct WindowRuleFile {
     pub size: Option<[i32; 2]>,
     #[serde(default)]
     pub widget: bool,
+    /// Pin the window to one output's screen space: it ignores pan/zoom and
+    /// renders above normal windows. `position` is then output-relative
+    /// (center, Y-up), not a canvas coordinate.
+    #[serde(default)]
+    pub pinned_to_screen: bool,
     pub decoration: Option<String>,
     pub blur: Option<bool>,
     pub opacity: Option<f64>,

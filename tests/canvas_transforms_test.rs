@@ -1,7 +1,9 @@
 use std::time::Duration;
 
-use driftwm::canvas::{CanvasPos, MomentumState, ScreenPos, canvas_to_screen, screen_to_canvas};
-use smithay::utils::Point;
+use driftwm::canvas::{
+    CanvasPos, MomentumState, ScreenPos, canvas_to_screen, rule_to_internal, screen_to_canvas,
+};
+use smithay::utils::{Point, Size};
 
 // --- Coordinate transform round-trip tests (zoom=1.0) ---
 
@@ -299,5 +301,110 @@ fn momentum_compressed_burst_velocity_is_bounded() {
         m.velocity.x < 5000.0,
         "compressed burst must not produce explosive velocity; got {} px/sec",
         m.velocity.x
+    );
+}
+
+// ── Pinned-window coordinate round-trips (zoom != 1.0) ───────────────────────
+
+const EPSILON: f64 = 1e-10;
+
+#[test]
+fn pin_unpin_round_trip_at_zoom_half() {
+    // Simulates: pin a canvas point to screen for rendering, then unpin back.
+    // canvas → screen → canvas must recover the original point.
+    let canvas = CanvasPos(Point::from((800.0, 600.0)));
+    let camera = Point::from((300.0, 200.0));
+    let zoom = 0.5;
+    let screen = canvas_to_screen(canvas, camera, zoom);
+    let recovered = screen_to_canvas(screen, camera, zoom);
+    assert!((recovered.0.x - canvas.0.x).abs() < EPSILON);
+    assert!((recovered.0.y - canvas.0.y).abs() < EPSILON);
+}
+
+#[test]
+fn pin_unpin_round_trip_at_zoom_037() {
+    let canvas = CanvasPos(Point::from((1200.0, -400.0)));
+    let camera = Point::from((-100.0, 50.0));
+    let zoom = 0.37;
+    let screen = canvas_to_screen(canvas, camera, zoom);
+    let recovered = screen_to_canvas(screen, camera, zoom);
+    assert!((recovered.0.x - canvas.0.x).abs() < EPSILON);
+    assert!((recovered.0.y - canvas.0.y).abs() < EPSILON);
+}
+
+#[test]
+fn delta_scaling_canvas_to_screen_at_zoom_half() {
+    // Δscreen = Δcanvas * zoom. The move/resize grabs rely on this property.
+    let camera = Point::from((100.0, 50.0));
+    let zoom = 0.5;
+    let base = CanvasPos(Point::from((500.0, 300.0)));
+    let delta_canvas: Point<f64, smithay::utils::Logical> = Point::from((80.0, 40.0));
+    let shifted = CanvasPos(Point::from((
+        base.0.x + delta_canvas.x,
+        base.0.y + delta_canvas.y,
+    )));
+
+    let s_base = canvas_to_screen(base, camera, zoom);
+    let s_shifted = canvas_to_screen(shifted, camera, zoom);
+
+    let delta_screen_x = s_shifted.0.x - s_base.0.x;
+    let delta_screen_y = s_shifted.0.y - s_base.0.y;
+
+    assert!((delta_screen_x - delta_canvas.x * zoom).abs() < EPSILON);
+    assert!((delta_screen_y - delta_canvas.y * zoom).abs() < EPSILON);
+}
+
+#[test]
+fn delta_scaling_canvas_to_screen_at_zoom_037() {
+    let camera = Point::from((200.0, 150.0));
+    let zoom = 0.37;
+    let base = CanvasPos(Point::from((1000.0, 800.0)));
+    let delta_canvas: Point<f64, smithay::utils::Logical> = Point::from((120.0, -60.0));
+    let shifted = CanvasPos(Point::from((
+        base.0.x + delta_canvas.x,
+        base.0.y + delta_canvas.y,
+    )));
+
+    let s_base = canvas_to_screen(base, camera, zoom);
+    let s_shifted = canvas_to_screen(shifted, camera, zoom);
+
+    assert!((s_shifted.0.x - s_base.0.x - delta_canvas.x * zoom).abs() < EPSILON);
+    assert!((s_shifted.0.y - s_base.0.y - delta_canvas.y * zoom).abs() < EPSILON);
+}
+
+#[test]
+fn rule_position_zero_zero_centers_window_on_output() {
+    // rule [0, 0] means the window center sits at the output center.
+    // screen top-left of window = output_center + rule_to_internal(0, 0, size)
+    //                           = output_center + (-w/2, -h/2)  (i.e. centered)
+    let output_w = 1920_i32;
+    let output_h = 1080_i32;
+    let win_w = 800_i32;
+    let win_h = 600_i32;
+    let size: Size<i32, smithay::utils::Logical> = Size::from((win_w, win_h));
+
+    let output_center_x = output_w / 2;
+    let output_center_y = output_h / 2;
+
+    let offset = rule_to_internal(0, 0, size);
+    let screen_tl_x = output_center_x + offset.x;
+    let screen_tl_y = output_center_y + offset.y;
+
+    // Window should be perfectly centered on the output.
+    assert_eq!(screen_tl_x, output_center_x - win_w / 2);
+    assert_eq!(screen_tl_y, output_center_y - win_h / 2);
+}
+
+#[test]
+fn rule_positive_y_moves_window_up_on_screen() {
+    // In the Y-up rule convention, positive Y is "up" — which means smaller
+    // screen Y (further from the bottom of the screen).
+    let size: Size<i32, smithay::utils::Logical> = Size::from((200, 100));
+    let at_zero = rule_to_internal(0, 0, size);
+    let at_positive_y = rule_to_internal(0, 50, size);
+    // Moving up (positive rule Y) should decrease the internal Y coordinate.
+    assert!(
+        at_positive_y.y < at_zero.y,
+        "positive rule Y should produce smaller internal Y (higher on screen)"
     );
 }

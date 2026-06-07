@@ -251,6 +251,7 @@
 #   toggle-fullscreen       — toggle focused window fullscreen
 #   fit-window              — toggle maximize: centers + resets zoom + fills viewport; restore only resizes back
 #   fit-window-snapped      — fit-window for the focused window's whole snap cluster
+#   toggle-pin-to-screen    — pin/unpin the focused window to the screen (ignores pan/zoom, floats above)
 #   reload-config           — hot-reload config file
 #   quit                    — exit the compositor
 #   send-to-output <dir>    — move focused window to adjacent output
@@ -267,6 +268,7 @@
 # "mod+f" = "toggle-fullscreen"
 # "mod+m" = "fit-window"
 # "mod+shift+m" = "fit-window-snapped"
+# "mod+t" = "toggle-pin-to-screen"
 # "mod+c" = "center-window"
 # "mod+x" = "focus-center"
 # "mod+a" = "home-toggle"
@@ -458,10 +460,15 @@
 #   cat $XDG_RUNTIME_DIR/driftwm/state   (see the "windows=" line)
 #
 # Effect fields:
-#   position   — [x, y] canvas coordinates to place the window (window center, Y-up)
+#   position   — [x, y] coordinates (window center, Y-up). Canvas coords, or
+#                output-relative (origin = output center) when pinned_to_screen.
 #   size       — [width, height] initial window dimensions (one-shot; user/app can resize after)
 #   widget     — true: pinned (immovable), below normal windows, excluded from
 #                navigation and alt-tab (default: false)
+#   pinned_to_screen — true: lock the window to the output's screen space —
+#                ignores pan/zoom, floats above normal windows (PiP, toolbars).
+#                `position` becomes output-relative; movable unless widget = true.
+#                Toggle live with `toggle-pin-to-screen` (Mod+T). (default: false)
 #   decoration — overrides [decorations] default_mode for matched windows.
 #                Omit to inherit default_mode. Values:
 #                "client":  CSD — client's own titlebar
@@ -506,6 +513,13 @@
 # # position   = [0, 0]
 # # widget     = true
 # # decoration = "none"
+#
+# # Picture-in-Picture: pinned to the screen, stays put while you pan/zoom.
+# # Movable/resizable; drop `position` to center it on the active output.
+# # [[window_rules]]
+# # title            = "Picture-in-Picture"
+# # pinned_to_screen = true
+# # position         = [0, -300]   # output-relative: 300px below center
 #
 # # Blurred transparent terminal
 # # [[window_rules]]

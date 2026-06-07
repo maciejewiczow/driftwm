@@ -267,6 +267,13 @@ pub(super) fn default_bindings(
         ),
         (
             KeyCombo {
+                modifiers: m.clone(),
+                sym: Keysym::from(keysyms::KEY_t),
+            },
+            Action::TogglePinToScreen,
+        ),
+        (
+            KeyCombo {
                 modifiers: Modifiers {
                     ctrl: true,
                     shift: true,

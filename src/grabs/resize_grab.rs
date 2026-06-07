@@ -79,11 +79,15 @@ pub enum ResizeState {
         edges: xdg_toplevel::ResizeEdge,
         initial_window_location: Point<i32, Logical>,
         initial_window_size: Size<i32, Logical>,
+        /// `Some` ⟹ pinned window: top/left-edge repositioning adjusts
+        /// `PinnedState.screen_pos` (output-relative) instead of the canvas loc.
+        initial_screen_pos: Option<Point<i32, Logical>>,
     },
     WaitingForLastCommit {
         edges: xdg_toplevel::ResizeEdge,
         initial_window_location: Point<i32, Logical>,
         initial_window_size: Size<i32, Logical>,
+        initial_screen_pos: Option<Point<i32, Logical>>,
     },
 }
 
@@ -107,6 +111,11 @@ pub struct ResizeSurfaceGrab {
     /// `members` + empty `exclude` for single-window resize (every cluster
     /// loop becomes a no-op, `snap_targets` behaves as pre-slice-2).
     pub cluster_resize: ClusterResizeSnapshot,
+    /// `Some` ⟹ resizing a screen-pinned window: the size delta is taken in
+    /// output-relative screen space (× zoom), there's no snap or cluster reflow,
+    /// and top/left-edge repositioning targets `screen_pos`. Holds the
+    /// window's `screen_pos` at grab start.
+    pub pinned_initial_screen_pos: Option<Point<i32, Logical>>,
 }
 
 /// Check if `edges` includes a horizontal/vertical component via raw bit values.
@@ -140,6 +149,62 @@ impl PointerGrab<DriftWm> for ResizeSurfaceGrab {
             .is_some_and(|fo| *fo != self.output)
         {
             data.focused_output = Some(self.output.clone());
+            let clamped_event = MotionEvent {
+                location: self.last_clamped_location,
+                serial: event.serial,
+                time: event.time,
+            };
+            handle.motion(data, None, &clamped_event);
+            return;
+        }
+
+        // Screen-pinned resize: size delta in output-relative screen space, no
+        // snap / cluster. Top/left-edge repositioning of `screen_pos` happens at
+        // commit (handle_resize_commit), mirroring the canvas path.
+        if let Some(_initial_screen_pos) = self.pinned_initial_screen_pos {
+            let (camera, zoom) = {
+                let os = crate::state::output_state(&self.output);
+                (os.camera, os.zoom)
+            };
+            let output_size = crate::state::output_logical_size(&self.output);
+            let screen = canvas_to_screen(CanvasPos(event.location), camera, zoom).0;
+            let clamped_screen: Point<f64, Logical> = (
+                screen.x.clamp(0.0, output_size.w as f64 - 1.0),
+                screen.y.clamp(0.0, output_size.h as f64 - 1.0),
+            )
+                .into();
+            self.last_clamped_location =
+                canvas::screen_to_canvas(canvas::ScreenPos(clamped_screen), camera, zoom).0;
+
+            let start_screen =
+                canvas_to_screen(CanvasPos(self.start_data.location), camera, zoom).0;
+            let delta = clamped_screen - start_screen;
+
+            let mut new_w = self.initial_window_size.w;
+            let mut new_h = self.initial_window_size.h;
+            if has_left(self.edges) {
+                new_w -= delta.x as i32;
+            } else if has_right(self.edges) {
+                new_w += delta.x as i32;
+            }
+            if has_top(self.edges) {
+                new_h -= delta.y as i32;
+            } else if has_bottom(self.edges) {
+                new_h += delta.y as i32;
+            }
+            let (new_w, new_h) = self.constraints.clamp(new_w, new_h);
+            let new_size = Size::from((new_w, new_h));
+            if new_size != self.last_window_size {
+                self.last_window_size = new_size;
+                if let Some(toplevel) = self.window.toplevel() {
+                    toplevel.with_pending_state(|state| {
+                        state.size = Some(new_size);
+                        state.states.set(xdg_toplevel::State::Resizing);
+                    });
+                    toplevel.send_pending_configure();
+                }
+            }
+
             let clamped_event = MotionEvent {
                 location: self.last_clamped_location,
                 serial: event.serial,
@@ -284,6 +349,7 @@ impl PointerGrab<DriftWm> for ResizeSurfaceGrab {
                         edges,
                         initial_window_location,
                         initial_window_size,
+                        initial_screen_pos: self.pinned_initial_screen_pos,
                     });
             });
 

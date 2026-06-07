@@ -7,13 +7,13 @@ use smithay::{
         pointer::{ButtonEvent, GrabStartData, MotionEvent, PointerGrab, PointerInnerHandle},
     },
     output::Output,
-    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
     utils::{IsAlive, Logical, Point},
     wayland::seat::WaylandFocus,
 };
 
 use crate::state::{DriftWm, output_logical_size, output_state};
-use driftwm::canvas::{CanvasPos, canvas_to_screen};
+use driftwm::canvas::{CanvasPos, ScreenPos, canvas_to_screen, screen_to_canvas};
 use driftwm::layout::snap::{SnapParams, SnapState, update_axis};
 
 /// Which output edge is inhibited after a cross-output teleport.
@@ -50,6 +50,12 @@ pub struct MoveSurfaceGrab {
     /// (especially during snap holds), so bumping the blur generation
     /// unconditionally re-runs Kawase blur on every blurred window for nothing.
     last_mapped_loc: Option<Point<i32, Logical>>,
+    /// `Some` ⟹ this drag moves a screen-pinned window. The value is the
+    /// fixed screen-space offset from the cursor to the window's top-left,
+    /// captured at grab start. The window tracks `cursor_screen + offset`,
+    /// reassigning to whichever output the cursor is on — no snap, no cluster,
+    /// no edge-pan (pinned windows ignore the camera).
+    pinned_grab_offset: Option<Point<f64, Logical>>,
 }
 
 impl MoveSurfaceGrab {
@@ -71,6 +77,29 @@ impl MoveSurfaceGrab {
             cluster_members,
             cluster_member_surfaces,
             last_mapped_loc: None,
+            pinned_grab_offset: None,
+        }
+    }
+
+    /// Move grab for a screen-pinned window. `grab_offset` is the screen-space
+    /// offset from the cursor to the window's top-left at grab start.
+    pub fn new_pinned(
+        start_data: GrabStartData<DriftWm>,
+        window: Window,
+        output: Output,
+        grab_offset: Point<f64, Logical>,
+    ) -> Self {
+        Self {
+            start_data,
+            window,
+            initial_window_location: Point::from((0, 0)),
+            snap: SnapState::default(),
+            output,
+            inhibited_edge: None,
+            cluster_members: Vec::new(),
+            cluster_member_surfaces: HashSet::new(),
+            last_mapped_loc: None,
+            pinned_grab_offset: Some(grab_offset),
         }
     }
 
@@ -215,6 +244,41 @@ impl PointerGrab<DriftWm> for MoveSurfaceGrab {
         _focus: Option<(<DriftWm as SeatHandler>::PointerFocus, Point<f64, Logical>)>,
         event: &MotionEvent,
     ) {
+        // Screen-pinned move: track the cursor with a fixed screen-space offset.
+        // The window reassigns to whichever output the cursor is on (free
+        // multi-monitor move). No snap / cluster / edge-pan.
+        if let Some(grab_offset) = self.pinned_grab_offset {
+            let output = data
+                .focused_output
+                .clone()
+                .unwrap_or_else(|| self.output.clone());
+            let (camera, zoom) = {
+                let os = output_state(&output);
+                (os.camera, os.zoom)
+            };
+            let cursor_screen = canvas_to_screen(CanvasPos(event.location), camera, zoom).0;
+            let new_screen = cursor_screen + grab_offset;
+            let new_screen_pos =
+                Point::from((new_screen.x.round() as i32, new_screen.y.round() as i32));
+            self.output = output.clone();
+            if let Some(id) = self.window.wl_surface().map(|s| s.id())
+                && let Some(p) = data.pinned.get_mut(&id)
+            {
+                p.output = output.clone();
+                p.screen_pos = new_screen_pos;
+            }
+            let canvas = screen_to_canvas(ScreenPos(new_screen_pos.to_f64()), camera, zoom)
+                .0
+                .to_i32_round();
+            data.space.map_element(self.window.clone(), canvas, false);
+            if self.last_mapped_loc != Some(canvas) {
+                data.render.blur_geometry_generation += 1;
+                self.last_mapped_loc = Some(canvas);
+            }
+            handle.motion(data, None, event);
+            return;
+        }
+
         // Phase 3 input routing already converted event.location to the focused
         // output's canvas space and updated data.focused_output. If that differs
         // from self.output, the pointer crossed an output boundary.

@@ -45,6 +45,11 @@ impl DriftWm {
             let Some(surface) = window.wl_surface() else {
                 continue;
             };
+            // Pinned windows have no canvas position; omit from the inventory
+            // (state file + IPC `state`), whose `position` is a canvas coord.
+            if self.is_pinned(window) {
+                continue;
+            }
             let (app_id, title) = smithay::wayland::compositor::with_states(&surface, |states| {
                 states
                     .data_map

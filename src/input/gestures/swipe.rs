@@ -78,6 +78,7 @@ impl DriftWm {
                                 .as_ref()
                                 .and_then(|s| driftwm::config::applied_rule(s))
                                 .is_some_and(|r| r.widget)
+                                && !self.is_pinned(w)
                         }) {
                             let want_cluster =
                                 matches!(action, ContinuousAction::ResizeWindowSnapped);
@@ -112,10 +113,12 @@ impl DriftWm {
                         self.gesture_state = Some(GestureState::SwipePan);
                     }
                     ContinuousAction::MoveWindow => {
-                        if let Some((window, _)) = self.window_under(pos) {
+                        if let Some((window, _)) =
+                            self.window_under(pos).filter(|(w, _)| !self.is_pinned(w))
+                        {
                             return self.start_gesture_move(window, pos);
                         }
-                        // Not over window — fall back to pan
+                        // Not over window (or pinned) — fall back to pan
                         self.gesture_state = Some(GestureState::SwipePan);
                     }
                     ContinuousAction::ResizeWindow | ContinuousAction::ResizeWindowSnapped => {
@@ -124,6 +127,7 @@ impl DriftWm {
                                 .as_ref()
                                 .and_then(|s| driftwm::config::applied_rule(s))
                                 .is_some_and(|r| r.widget)
+                                && !self.is_pinned(w)
                         }) {
                             let want_cluster =
                                 matches!(action, ContinuousAction::ResizeWindowSnapped);
@@ -373,6 +377,7 @@ impl DriftWm {
                         &self.space,
                         &self.decorations,
                         &self.config.decorations,
+                        &self.pinned,
                         &self_surface,
                         &cluster_resize.exclude,
                     );
@@ -505,6 +510,8 @@ impl DriftWm {
                                 edges,
                                 initial_window_location: initial_location,
                                 initial_window_size: initial_size,
+                                // Gesture resize excludes pinned windows.
+                                initial_screen_pos: None,
                             });
                     });
                 }
@@ -608,6 +615,8 @@ impl DriftWm {
                     edges,
                     initial_window_location: initial_location,
                     initial_window_size: initial_size,
+                    // Gesture resize excludes pinned windows.
+                    initial_screen_pos: None,
                 });
         });
 

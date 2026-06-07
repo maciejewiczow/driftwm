@@ -203,6 +203,12 @@ impl DriftWm {
             return Some(hit);
         }
 
+        // Screen-pinned windows: above normal canvas windows, below Top/Overlay.
+        if let Some(hit) = self.pinned_window_under(screen_pos, canvas_pos) {
+            self.pointer_over_layer = false;
+            return Some(hit);
+        }
+
         // Non-widget canvas windows (visually above canvas layers)
         if let Some(hit) = self.surface_under(canvas_pos, Some(false)) {
             self.pointer_over_layer = false;
@@ -246,11 +252,13 @@ impl DriftWm {
         }
         let window = self.space.element_under(canvas_pos).map(|(w, _)| w.clone());
         let Some(window) = window else { return };
+        // Pinned windows are screen-space; the canvas element_under hit is
+        // unreliable for them (handled by pinned_window_under instead).
         let is_widget = window
             .wl_surface()
             .and_then(|s| driftwm::config::applied_rule(&s))
             .is_some_and(|r| r.widget);
-        if is_widget {
+        if is_widget || self.is_pinned(&window) {
             return;
         }
 
@@ -732,6 +740,11 @@ impl DriftWm {
             let Some(wl_surface) = window.wl_surface() else {
                 continue;
             };
+            // Pinned windows live in screen space — hit-tested by
+            // `pinned_window_under`, never by the canvas-space path.
+            if self.is_pinned(window) {
+                continue;
+            }
             let rule = driftwm::config::applied_rule(&wl_surface);
             if let Some(want_widget) = widget_filter {
                 let is_widget = rule.as_ref().is_some_and(|r| r.widget);
@@ -788,13 +801,178 @@ impl DriftWm {
         None
     }
 
+    /// Find the pinned window (content or SSD decoration) under a screen-space
+    /// pointer position. Pinned windows render at scale 1.0 at their fixed
+    /// `screen_pos`, so hit-testing is done entirely in output-relative screen
+    /// coords. The returned focus location is canvas-adjusted exactly like
+    /// `layer_surface_under` so smithay's `pointer_canvas − focus_loc` yields
+    /// correct surface-local coordinates. Only windows on the active output are
+    /// considered — the pointer is always on the active output, and `screen_pos`
+    /// is relative to it.
+    pub(crate) fn pinned_window_under(
+        &self,
+        screen_pos: Point<f64, smithay::utils::Logical>,
+        canvas_pos: Point<f64, smithay::utils::Logical>,
+    ) -> Option<(FocusTarget, Point<f64, smithay::utils::Logical>)> {
+        if self.pinned.is_empty() {
+            return None;
+        }
+        let output = self.active_output()?;
+        let bar_height = self.config.decorations.title_bar_height;
+        let border_width = driftwm::config::DecorationConfig::RESIZE_BORDER_WIDTH;
+
+        for window in self.space.elements().rev() {
+            let Some(wl_surface) = window.wl_surface() else {
+                continue;
+            };
+            let Some(p) = self.pinned.get(&wl_surface.id()) else {
+                continue;
+            };
+            if p.output != output {
+                continue;
+            }
+            // Surface-tree (buffer) origin in output-relative screen coords.
+            let surface_origin = p.screen_pos - window.geometry().loc;
+
+            if let Some((surface, surface_loc)) =
+                window.surface_under(screen_pos - surface_origin.to_f64(), WindowSurfaceType::ALL)
+            {
+                let screen_loc = (surface_loc + surface_origin).to_f64();
+                let adjusted = screen_loc + (canvas_pos - screen_pos);
+                return Some((FocusTarget(surface), adjusted));
+            }
+
+            let size = window.geometry().size;
+            if self.decorations.contains_key(&wl_surface.id()) {
+                if crate::decorations::close_button_contains(
+                    screen_pos,
+                    p.screen_pos,
+                    size.w,
+                    bar_height,
+                ) || crate::decorations::title_bar_contains(
+                    screen_pos,
+                    p.screen_pos,
+                    size.w,
+                    bar_height,
+                ) || crate::decorations::resize_edge_at(
+                    screen_pos,
+                    p.screen_pos,
+                    size,
+                    bar_height,
+                    border_width,
+                )
+                .is_some()
+                {
+                    let adjusted = p.screen_pos.to_f64() + (canvas_pos - screen_pos);
+                    return Some((FocusTarget((*wl_surface).clone()), adjusted));
+                }
+            } else {
+                let is_widget =
+                    driftwm::config::applied_rule(&wl_surface).is_some_and(|r| r.widget);
+                if !is_widget
+                    && crate::decorations::resize_edge_at(
+                        screen_pos,
+                        p.screen_pos,
+                        size,
+                        0,
+                        border_width,
+                    )
+                    .is_some()
+                {
+                    let adjusted = p.screen_pos.to_f64() + (canvas_pos - screen_pos);
+                    return Some((FocusTarget((*wl_surface).clone()), adjusted));
+                }
+            }
+        }
+        None
+    }
+
+    /// Screen-space SSD-decoration hit-test for pinned windows (mirror of
+    /// `decoration_under`). `screen_pos` is output-relative. Used by the button
+    /// dispatch and the cursor update so pinned windows' title bar / close
+    /// button / resize borders behave like canvas windows'.
+    pub(crate) fn pinned_decoration_under(
+        &self,
+        screen_pos: Point<f64, smithay::utils::Logical>,
+    ) -> Option<(Window, crate::decorations::DecorationHit)> {
+        use crate::decorations::DecorationHit;
+        if self.pinned.is_empty() {
+            return None;
+        }
+        let output = self.active_output()?;
+        let bar_height = self.config.decorations.title_bar_height;
+        let border_width = driftwm::config::DecorationConfig::RESIZE_BORDER_WIDTH;
+
+        for window in self.space.elements().rev() {
+            let Some(wl_surface) = window.wl_surface() else {
+                continue;
+            };
+            let Some(p) = self.pinned.get(&wl_surface.id()) else {
+                continue;
+            };
+            if p.output != output {
+                continue;
+            }
+            let loc = p.screen_pos;
+            let size = window.geometry().size;
+
+            if self.decorations.contains_key(&wl_surface.id()) {
+                if crate::decorations::close_button_contains(screen_pos, loc, size.w, bar_height) {
+                    return Some((window.clone(), DecorationHit::CloseButton));
+                }
+                if crate::decorations::title_bar_contains(screen_pos, loc, size.w, bar_height) {
+                    return Some((window.clone(), DecorationHit::TitleBar));
+                }
+                if let Some(edge) = crate::decorations::resize_edge_at(
+                    screen_pos,
+                    loc,
+                    size,
+                    bar_height,
+                    border_width,
+                ) {
+                    return Some((window.clone(), DecorationHit::ResizeBorder(edge)));
+                }
+            } else {
+                let is_widget =
+                    driftwm::config::applied_rule(&wl_surface).is_some_and(|r| r.widget);
+                if !is_widget
+                    && let Some(edge) =
+                        crate::decorations::resize_edge_at(screen_pos, loc, size, 0, border_width)
+                {
+                    return Some((window.clone(), DecorationHit::ResizeBorder(edge)));
+                }
+            }
+
+            // Content occludes a lower window's decoration margin.
+            let surface_origin = loc - window.geometry().loc;
+            if window
+                .surface_under(screen_pos - surface_origin.to_f64(), WindowSurfaceType::ALL)
+                .is_some()
+            {
+                return None;
+            }
+        }
+        None
+    }
+
     /// Update cursor icon based on what decoration area the pointer is over.
     /// Called after pointer motion to set resize/pointer cursors for SSD areas.
     fn update_decoration_cursor(&mut self, canvas_pos: Point<f64, smithay::utils::Logical>) {
         if self.cursor.grab_cursor || self.pointer_over_layer {
             return;
         }
-        match self.decoration_under(canvas_pos) {
+        // Pinned windows are screen-space; check them first (they're above
+        // normal windows), then fall back to the canvas decoration hit-test.
+        let screen_pos = driftwm::canvas::canvas_to_screen(
+            driftwm::canvas::CanvasPos(canvas_pos),
+            self.camera(),
+            self.zoom(),
+        )
+        .0;
+        let hit = self
+            .pinned_decoration_under(screen_pos)
+            .or_else(|| self.decoration_under(canvas_pos));
+        match hit {
             Some((ref window, DecorationHit::CloseButton)) => {
                 self.cursor.decoration_cursor = true;
                 self.cursor.cursor_status = smithay::input::pointer::CursorImageStatus::Named(
@@ -841,6 +1019,7 @@ impl DriftWm {
                 hovered,
                 deco.scale,
                 &deco.title,
+                deco.pinned,
                 &self.config.decorations,
             );
         }
@@ -857,6 +1036,7 @@ impl DriftWm {
                     false,
                     deco.scale,
                     &deco.title,
+                    deco.pinned,
                     &self.config.decorations,
                 );
             }
@@ -877,6 +1057,11 @@ impl DriftWm {
             let Some(wl_surface) = window.wl_surface() else {
                 continue;
             };
+            // Pinned windows are screen-space; canvas-space decoration hit-test
+            // doesn't apply (their SSD is handled via pinned_window_under).
+            if self.is_pinned(window) {
+                continue;
+            }
             let Some(loc) = self.space.element_location(window) else {
                 continue;
             };

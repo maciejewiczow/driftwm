@@ -233,8 +233,10 @@ fn cmd_focus(arg: Option<String>, state: &mut DriftWm) -> Reply {
             match found {
                 Some(window) => {
                     let app_id = window.app_id_or_class();
-                    // Already on screen: just raise + focus, don't move the camera.
-                    if state.window_fully_in_viewport(&window) {
+                    // Already on screen: just raise + focus, don't move the
+                    // camera. Pinned windows are always on screen and have no
+                    // canvas position to navigate to.
+                    if state.is_pinned(&window) || state.window_fully_in_viewport(&window) {
                         state.raise_and_focus(&window, SERIAL_COUNTER.next_serial());
                     } else {
                         state.navigate_to_window(&window, state.config.zoom_reset_on_activation);
@@ -323,16 +325,23 @@ fn resolve_screenshot_region(
             Ok(crate::state::output_viewport_rect(&output))
         }
         ScreenshotTarget::Window => {
+            // Pinned windows render in screen space and are excluded from the
+            // canvas-capture path by construction, so there's no canvas region
+            // to capture — refuse rather than emit the background behind them.
             let window = state
                 .focused_window()
-                .filter(|w| !w.is_widget())
+                .filter(|w| !w.is_widget() && !state.is_pinned(w))
                 .ok_or("no focused window to capture")?;
             window_visual_rect(state, &window)
                 .ok_or_else(|| "focused window has no capturable area".to_string())
         }
         ScreenshotTarget::All => {
             let mut acc: Option<Rectangle<i32, Logical>> = None;
-            for w in state.space.elements().filter(|w| !w.is_widget()) {
+            for w in state
+                .space
+                .elements()
+                .filter(|w| !w.is_widget() && !state.is_pinned(w))
+            {
                 let Some(r) = window_visual_rect(state, w) else {
                     continue;
                 };

@@ -161,6 +161,21 @@ impl DriftWm {
                 return;
             }
 
+            // Screen-pinned windows live above normal windows in screen space;
+            // decoration_under / element_under are canvas-space and miss them at
+            // zoom != 1, so dispatch their clicks separately.
+            if self.try_pinned_button(
+                &pointer,
+                pos,
+                button,
+                button_state,
+                serial,
+                mods,
+                Event::time_msec(&event),
+            ) {
+                return;
+            }
+
             // SSD decoration clicks: title bar → move, close button → close, resize border → resize
             if let Some((window, hit)) = self.decoration_under(pos) {
                 // Decoration interactions must only apply to the topmost window.
@@ -266,6 +281,7 @@ impl DriftWm {
                             self.space.element_under(pos).map(|(w, l)| (w.clone(), l))
                             && let Some(surface) = window.wl_surface()
                             && !config::applied_rule(&surface).is_some_and(|r| r.widget)
+                            && !self.is_pinned(&window)
                         {
                             self.raise_and_focus(&window, serial);
 
@@ -314,6 +330,7 @@ impl DriftWm {
                                 .wl_surface()
                                 .and_then(|s| config::applied_rule(&s))
                                 .is_some_and(|r| r.widget)
+                            && !self.is_pinned(&window)
                         {
                             self.raise_and_focus(&window, serial);
 
@@ -405,6 +422,150 @@ impl DriftWm {
         pointer.frame(self);
     }
 
+    /// Dispatch a left/other button press over a screen-pinned window in screen
+    /// coords: SSD decoration (close / title-bar move / resize border), then
+    /// mouse-binding move/resize, else focus + forward the click to the client.
+    /// Returns `true` if the press was consumed (caller should stop dispatching).
+    #[allow(clippy::too_many_arguments)]
+    fn try_pinned_button(
+        &mut self,
+        pointer: &smithay::input::pointer::PointerHandle<DriftWm>,
+        pos: Point<f64, smithay::utils::Logical>,
+        button: u32,
+        button_state: ButtonState,
+        serial: smithay::utils::Serial,
+        mods: smithay::input::keyboard::ModifiersState,
+        time: u32,
+    ) -> bool {
+        if self.pinned.is_empty() {
+            return false;
+        }
+        let screen_pos = canvas_to_screen(CanvasPos(pos), self.camera(), self.zoom()).0;
+
+        if button == config::BTN_LEFT
+            && let Some((window, hit)) = self.pinned_decoration_under(screen_pos)
+        {
+            let is_widget = window
+                .wl_surface()
+                .and_then(|s| config::applied_rule(&s))
+                .is_some_and(|r| r.widget);
+            match hit {
+                DecorationHit::CloseButton => window.send_close(),
+                DecorationHit::TitleBar if !is_widget => {
+                    self.raise_and_focus(&window, serial);
+                    self.start_pinned_move(pointer, &window, pos, button, serial);
+                }
+                DecorationHit::ResizeBorder(edge) if !is_widget => {
+                    self.raise_and_focus(&window, serial);
+                    self.start_compositor_resize_with_edge(
+                        pointer,
+                        &window,
+                        pos,
+                        button,
+                        serial,
+                        Some(edge),
+                        false,
+                    );
+                }
+                _ => {
+                    if let Some(s) = window.wl_surface() {
+                        let keyboard = self.seat.get_keyboard().unwrap();
+                        keyboard.set_focus(self, Some(FocusTarget(s.into_owned())), serial);
+                    }
+                }
+            }
+            return true;
+        }
+
+        let Some((focus, _)) = self.pinned_window_under(screen_pos, pos) else {
+            return false;
+        };
+        let pinned_window = self.window_for_surface(&focus.0);
+        if let Some(action) = self
+            .config
+            .mouse_button_lookup_ctx(&mods, button, BindingContext::OnWindow)
+            .cloned()
+            && let Some(ref window) = pinned_window
+            && !window.is_widget()
+        {
+            match action {
+                MouseAction::MoveWindow | MouseAction::MoveSnappedWindows => {
+                    self.raise_and_focus(window, serial);
+                    self.start_pinned_move(pointer, window, pos, button, serial);
+                    return true;
+                }
+                MouseAction::ResizeWindow | MouseAction::ResizeWindowSnapped => {
+                    self.raise_and_focus(window, serial);
+                    // Infer the edge in screen space against the pinned rect.
+                    let edge = window
+                        .wl_surface()
+                        .and_then(|s| self.pinned.get(&s.id()).map(|p| p.screen_pos))
+                        .map(|sp| edges_from_position(screen_pos, sp, window.geometry().size));
+                    self.start_compositor_resize_with_edge(
+                        pointer, window, pos, button, serial, edge, false,
+                    );
+                    return true;
+                }
+                MouseAction::Action(ref a) => {
+                    self.raise_and_focus(window, serial);
+                    let a = a.clone();
+                    self.execute_action(&a);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        if let Some(ref window) = pinned_window {
+            self.raise_and_focus(window, serial);
+        }
+        pointer.button(
+            self,
+            &ButtonEvent {
+                button,
+                state: button_state,
+                serial,
+                time,
+            },
+        );
+        pointer.frame(self);
+        true
+    }
+
+    /// Start a screen-space move grab for a pinned window. The grab tracks the
+    /// cursor with the fixed screen-offset captured here.
+    pub(crate) fn start_pinned_move(
+        &mut self,
+        pointer: &smithay::input::pointer::PointerHandle<DriftWm>,
+        window: &smithay::desktop::Window,
+        pos: Point<f64, smithay::utils::Logical>,
+        button: u32,
+        serial: smithay::utils::Serial,
+    ) {
+        let Some(id) = window.wl_surface().map(|s| s.id()) else {
+            return;
+        };
+        let Some((output, screen_pos)) = self
+            .pinned
+            .get(&id)
+            .map(|p| (p.output.clone(), p.screen_pos))
+        else {
+            return;
+        };
+        let (camera, zoom) = {
+            let os = crate::state::output_state(&output);
+            (os.camera, os.zoom)
+        };
+        let cursor_screen = canvas_to_screen(CanvasPos(pos), camera, zoom).0;
+        let grab_offset = screen_pos.to_f64() - cursor_screen;
+        let start_data = GrabStartData {
+            focus: None,
+            button,
+            location: pos,
+        };
+        let grab = MoveSurfaceGrab::new_pinned(start_data, window.clone(), output, grab_offset);
+        pointer.set_grab(self, grab, serial, Focus::Clear);
+    }
+
     /// Start a compositor-side resize grab. If `explicit_edge` is provided, use it;
     /// otherwise infer edges from pointer position within the window.
     ///
@@ -449,7 +610,24 @@ impl DriftWm {
         let initial_window_size = window.geometry().size;
 
         let edges = explicit_edge.unwrap_or_else(|| {
-            edges_from_position(pos, initial_window_location, initial_window_size)
+            // Pinned windows live in screen space — infer the edge against their
+            // screen rect, since the canvas-space inference is wrong at zoom != 1.
+            // (Pinned dispatch already passes an explicit edge; this keeps the
+            // function correct for any future inferred-edge caller.)
+            if let Some((sp, output)) = window.wl_surface().and_then(|s| {
+                self.pinned
+                    .get(&s.id())
+                    .map(|p| (p.screen_pos, p.output.clone()))
+            }) {
+                let (camera, zoom) = {
+                    let os = crate::state::output_state(&output);
+                    (os.camera, os.zoom)
+                };
+                let screen_pos = canvas_to_screen(CanvasPos(pos), camera, zoom).0;
+                edges_from_position(screen_pos, sp, initial_window_size)
+            } else {
+                edges_from_position(pos, initial_window_location, initial_window_size)
+            }
         });
 
         // Store resize state for commit() repositioning
@@ -460,6 +638,12 @@ impl DriftWm {
         // Clear fit state — user took manual control
         crate::state::fit::clear_fit_state(&wl_surface);
 
+        // Pinned windows resize in screen space; capture their `screen_pos` and
+        // fixed output so the grab and the commit-time reposition use the right
+        // anchor. `None` for normal canvas windows.
+        let pinned_initial_screen_pos = self.pinned.get(&wl_surface.id()).map(|p| p.screen_pos);
+        let pinned_output = self.pinned.get(&wl_surface.id()).map(|p| p.output.clone());
+
         with_states(&wl_surface, |states| {
             states
                 .data_map
@@ -468,6 +652,7 @@ impl DriftWm {
                     edges,
                     initial_window_location,
                     initial_window_size,
+                    initial_screen_pos: pinned_initial_screen_pos,
                 });
         });
 
@@ -489,15 +674,16 @@ impl DriftWm {
             button,
             location: pos,
         };
-        let Some(output) = self.active_output() else {
+        let Some(output) = pinned_output.clone().or_else(|| self.active_output()) else {
             return;
         };
-        // Only snapshot the cluster when the caller opted in. For
-        // single-window resize (`want_cluster = false`) we hand the grab an
+        // Only snapshot the cluster when the caller opted in. Pinned windows
+        // never cluster (they're off-canvas), so force the empty snapshot.
+        // For single-window resize (`want_cluster = false`) we hand the grab an
         // empty snapshot so `cluster_resize.members.is_empty()` short-circuits
         // the motion-time cascade and `snap_targets` sees no exclusions —
         // exactly the pre-slice-2 behavior.
-        let cluster_resize = if want_cluster {
+        let cluster_resize = if want_cluster && pinned_initial_screen_pos.is_none() {
             self.cluster_snapshot_for_resize(window, edges)
         } else {
             ClusterResizeSnapshot::empty()
@@ -515,6 +701,7 @@ impl DriftWm {
             snap: driftwm::layout::snap::SnapState::default(),
             constraints,
             cluster_resize,
+            pinned_initial_screen_pos,
         };
         pointer.set_grab(self, grab, serial, Focus::Clear);
     }

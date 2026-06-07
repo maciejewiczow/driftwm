@@ -9,6 +9,7 @@ fn bare_rule(app_id: Option<&str>, title: Option<&str>) -> WindowRule {
         position: None,
         size: None,
         widget: false,
+        pinned_to_screen: false,
         decoration: None,
         blur: false,
         opacity: None,
@@ -385,4 +386,107 @@ fn resolve_window_rules_wildcard_rule_matches_all_apps() {
     let b = config.resolve_window_rules("alacritty", "term").unwrap();
     assert_eq!(a.decoration, Some(DecorationMode::Server));
     assert_eq!(b.decoration, Some(DecorationMode::Server));
+}
+
+// ── pinned_to_screen ─────────────────────────────────────────────────────────
+
+#[test]
+fn pinned_to_screen_defaults_to_false() {
+    let rule = bare_rule(Some("foot"), None);
+    assert!(!rule.pinned_to_screen);
+}
+
+#[test]
+fn applied_rule_pinned_to_screen_defaults_to_false() {
+    let rule = bare_rule(Some("foot"), None);
+    let applied = AppliedWindowRule::from(&rule);
+    assert!(!applied.pinned_to_screen);
+}
+
+#[test]
+fn from_window_rule_copies_pinned_to_screen_true() {
+    let rule = WindowRule {
+        pinned_to_screen: true,
+        ..bare_rule(Some("foot"), None)
+    };
+    let applied = AppliedWindowRule::from(&rule);
+    assert!(applied.pinned_to_screen);
+}
+
+#[test]
+fn pinned_to_screen_is_sticky_on_in_merge_from() {
+    let rule_pinned = WindowRule {
+        pinned_to_screen: true,
+        ..bare_rule(Some("x"), None)
+    };
+    let rule_not_pinned = WindowRule {
+        pinned_to_screen: false,
+        ..bare_rule(Some("x"), None)
+    };
+
+    let mut applied = AppliedWindowRule::from(&rule_pinned);
+    assert!(applied.pinned_to_screen);
+    applied.merge_from(&rule_not_pinned);
+    assert!(
+        applied.pinned_to_screen,
+        "sticky-on: false rule must not clear pinned_to_screen"
+    );
+}
+
+#[test]
+fn pinned_to_screen_false_then_true_flips_on() {
+    let rule_not_pinned = WindowRule {
+        pinned_to_screen: false,
+        ..bare_rule(Some("x"), None)
+    };
+    let rule_pinned = WindowRule {
+        pinned_to_screen: true,
+        ..bare_rule(Some("x"), None)
+    };
+
+    let mut applied = AppliedWindowRule::from(&rule_not_pinned);
+    assert!(!applied.pinned_to_screen);
+    applied.merge_from(&rule_pinned);
+    assert!(applied.pinned_to_screen);
+}
+
+#[test]
+fn pinned_to_screen_parses_from_toml() {
+    let toml = r#"
+        [[window_rules]]
+        app_id = "myapp"
+        pinned_to_screen = true
+    "#;
+    let config = Config::from_toml(toml).unwrap();
+    let applied = config.resolve_window_rules("myapp", "title").unwrap();
+    assert!(applied.pinned_to_screen);
+}
+
+#[test]
+fn pinned_to_screen_omitted_in_toml_defaults_false() {
+    let toml = r#"
+        [[window_rules]]
+        app_id = "myapp"
+        blur = true
+    "#;
+    let config = Config::from_toml(toml).unwrap();
+    let applied = config.resolve_window_rules("myapp", "title").unwrap();
+    assert!(!applied.pinned_to_screen);
+}
+
+#[test]
+fn pinned_to_screen_sticky_across_two_toml_rules() {
+    // First rule (wildcard) pins; second rule (specific) does not — should stay pinned.
+    let toml = r#"
+        [[window_rules]]
+        app_id = "*"
+        pinned_to_screen = true
+
+        [[window_rules]]
+        app_id = "myapp"
+        opacity = 0.9
+    "#;
+    let config = Config::from_toml(toml).unwrap();
+    let applied = config.resolve_window_rules("myapp", "title").unwrap();
+    assert!(applied.pinned_to_screen);
 }

@@ -323,6 +323,17 @@ pub fn output_viewport_rect(output: &Output) -> Rectangle<i32, Logical> {
     )
 }
 
+/// Runtime state for a window pinned to one output's screen space (the
+/// `pinned_to_screen` rule or the `pin-to-screen` toggle). The window stays in
+/// `space` for focus/decorations/popups; rendering, hit-testing, and capture
+/// route through this instead of the camera transform. Source of truth for
+/// "is this window pinned" — `DriftWm::is_pinned`.
+pub struct PinnedState {
+    pub output: Output,
+    /// Output-relative top-left, Y-down (internal convention), pre-zoom.
+    pub screen_pos: Point<i32, Logical>,
+}
+
 /// Central compositor state.
 pub struct DriftWm {
     pub start_time: Instant,
@@ -355,6 +366,9 @@ pub struct DriftWm {
         crate::decorations::WindowDecoration,
     >,
     pub pending_ssd: HashSet<smithay::reexports::wayland_server::backend::ObjectId>,
+    /// Windows pinned to an output's screen space. Same lifetime as
+    /// `decorations` (keyed by surface `ObjectId`, cleaned on destroy).
+    pub pinned: HashMap<smithay::reexports::wayland_server::backend::ObjectId, PinnedState>,
     /// Supersample factor for SSD decoration buffers: `ceil` of the largest
     /// output scale. One buffer rendered at this density serves every output
     /// (downscaling stays crisp; only upscaling blurs).
@@ -818,6 +832,10 @@ impl DriftWm {
     /// Output whose viewport contains the window's center, or the active
     /// output if the window isn't visible on any.
     pub fn output_for_window(&self, window: &smithay::desktop::Window) -> Option<Output> {
+        // A pinned window is fixed to one output regardless of canvas geometry.
+        if let Some(p) = window.wl_surface().and_then(|s| self.pinned.get(&s.id())) {
+            return Some(p.output.clone());
+        }
         let loc = self.space.element_location(window)?;
         let geo = window.geometry();
         let center: Point<f64, Logical> = Point::from((
@@ -837,6 +855,67 @@ impl DriftWm {
             })
             .cloned();
         found.or_else(|| self.active_output())
+    }
+
+    /// True if `window` is pinned to an output's screen space.
+    pub fn is_pinned(&self, window: &Window) -> bool {
+        window
+            .wl_surface()
+            .is_some_and(|s| self.pinned.contains_key(&s.id()))
+    }
+
+    /// True if `window` is a real canvas window — neither a widget (wallpaper
+    /// layer, immovable) nor screen-pinned. The eligibility test for canvas
+    /// operations: navigation, centering, fitting, snapping, zoom-to-fit, etc.
+    pub fn is_canvas_window(&self, window: &Window) -> bool {
+        !window.is_widget() && !self.is_pinned(window)
+    }
+
+    /// Effective render transform for `window` in one pass: the pre-zoom,
+    /// output-relative logical origin of its surface tree (geometry top-left
+    /// minus `geometry().loc`) and the scale to render at. The single
+    /// canvas↔screen chokepoint — every render/capture consumer routes through
+    /// it so a pinned window is decided once, not re-inlined per site.
+    ///
+    /// - Normal window: `loc - geom_loc - camera`, scaled by `zoom`.
+    /// - Pinned window on its output: `screen_pos - geom_loc`, scale `1.0`
+    ///   (identity — no camera, no zoom).
+    /// - Pinned window on any other output: `None` (don't render here).
+    /// - `output = None` (off-screen canvas capture): pinned → `None` by
+    ///   construction, so captures never include screen-pinned windows.
+    pub fn window_render_transform(
+        &self,
+        window: &Window,
+        output: Option<&Output>,
+        camera: Point<f64, Logical>,
+        zoom: f64,
+    ) -> Option<(Point<f64, Logical>, f64)> {
+        let loc = self.space.element_location(window)?;
+        let geom_loc = window.geometry().loc;
+        let pinned = window.wl_surface().and_then(|s| {
+            self.pinned
+                .get(&s.id())
+                .map(|p| (p.output.clone(), p.screen_pos))
+        });
+        match pinned {
+            Some((pin_output, screen_pos)) => match output {
+                Some(o) if *o == pin_output => Some((
+                    Point::from((
+                        screen_pos.x as f64 - geom_loc.x as f64,
+                        screen_pos.y as f64 - geom_loc.y as f64,
+                    )),
+                    1.0,
+                )),
+                _ => None,
+            },
+            None => Some((
+                Point::from((
+                    loc.x as f64 - geom_loc.x as f64 - camera.x,
+                    loc.y as f64 - geom_loc.y as f64 - camera.y,
+                )),
+                zoom,
+            )),
+        }
     }
 
     pub fn output_in_direction(
@@ -1048,7 +1127,92 @@ impl DriftWm {
         }
         if changed {
             self.render.blur_camera_generation += 1;
+            self.sync_pinned_locs();
         }
+    }
+
+    /// Re-anchor each pinned window's `Space` location to the canvas point its
+    /// fixed `screen_pos` currently maps to. Without this the loc freezes at
+    /// placement and `Space::refresh` drifts it off its output as the camera
+    /// pans — triggering spurious `output_leave` and the visibility culls, which
+    /// would freeze the pinned window at 0 FPS. Re-mapped bottom-to-top in the
+    /// current z-order because `Space::map_element` raises the element to the
+    /// top of its z-class, so order-preserving re-map keeps multi-pinned
+    /// stacking and focus-raise intact. Only the canvas loc is touched —
+    /// rendering and hit-testing still read `screen_pos`.
+    fn sync_pinned_locs(&mut self) {
+        if self.pinned.is_empty() {
+            return;
+        }
+        let pinned_windows: Vec<Window> = self
+            .space
+            .elements()
+            .filter(|w| self.is_pinned(w))
+            .cloned()
+            .collect();
+        for window in pinned_windows {
+            let Some(id) = window.wl_surface().map(|s| s.id()) else {
+                continue;
+            };
+            let Some(p) = self.pinned.get(&id) else {
+                continue;
+            };
+            let screen_pos = p.screen_pos;
+            let (camera, zoom) = {
+                let os = output_state(&p.output);
+                (os.camera, os.zoom)
+            };
+            let canvas = driftwm::canvas::screen_to_canvas(
+                driftwm::canvas::ScreenPos(screen_pos.to_f64()),
+                camera,
+                zoom,
+            )
+            .0
+            .to_i32_round();
+            self.space.map_element(window, canvas, false);
+        }
+    }
+
+    /// Reassign every pinned window whose output is no longer a live space
+    /// output (it was unplugged) to `to`, clamping `screen_pos` into the new
+    /// output's bounds. Covers both the multi-output unplug (output already
+    /// unmapped) and the last-output reconnection (virtual placeholder swapped
+    /// for the new monitor).
+    pub fn reassign_orphaned_pinned(&mut self, to: &Output) {
+        if self.pinned.is_empty() {
+            return;
+        }
+        // Few outputs; a Vec + linear scan avoids the mutable-key-type lint
+        // (Output wraps an Arc with interior mutability).
+        let live: Vec<Output> = self.space.outputs().cloned().collect();
+        let to_size = output_logical_size(to);
+        let ids: Vec<_> = self
+            .pinned
+            .iter()
+            .filter(|(_, p)| !live.contains(&p.output))
+            .map(|(id, _)| id.clone())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        for id in ids {
+            let win_size = self
+                .space
+                .elements()
+                .find(|w| w.wl_surface().is_some_and(|s| s.id() == id))
+                .map(|w| w.geometry().size)
+                .unwrap_or_default();
+            if let Some(p) = self.pinned.get_mut(&id) {
+                p.output = to.clone();
+                p.screen_pos.x = p.screen_pos.x.clamp(0, (to_size.w - win_size.w).max(0));
+                p.screen_pos.y = p.screen_pos.y.clamp(0, (to_size.h - win_size.h).max(0));
+            }
+        }
+        // Re-anchor the Space loc to the new output now — `sync_pinned_locs`
+        // only fires on camera changes, which a hotplug doesn't guarantee, so
+        // without this the reassigned window keeps its stale (off the new
+        // output) canvas loc and gets culled until the next pan.
+        self.sync_pinned_locs();
     }
 
     pub fn get_viewport_size(&self) -> Size<i32, Logical> {
@@ -1213,7 +1377,7 @@ impl DriftWm {
             .and_then(|s| driftwm::config::applied_rule(&s))
             .is_some_and(|r| r.widget);
         let is_fs = self.fullscreen.values().any(|fs| &fs.window == focused);
-        if widget || is_fs {
+        if widget || is_fs || self.is_pinned(focused) {
             return None;
         }
 
@@ -1238,7 +1402,7 @@ impl DriftWm {
                 .and_then(|s| driftwm::config::applied_rule(&s))
                 .is_some_and(|r| r.widget);
             let is_fs = self.fullscreen.values().any(|fs| &fs.window == w);
-            if widget || is_fs {
+            if widget || is_fs || self.is_pinned(w) {
                 continue;
             }
             let Some(loc) = self.space.element_location(w) else {

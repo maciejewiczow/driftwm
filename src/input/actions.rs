@@ -1,6 +1,8 @@
 use smithay::{
     input::{keyboard::Layout, pointer::MotionEvent},
+    reexports::wayland_server::Resource,
     utils::{Point, SERIAL_COUNTER, Size},
+    wayland::seat::WaylandFocus,
 };
 
 use crate::state::{DriftWm, FocusTarget, HomeReturn};
@@ -58,7 +60,7 @@ impl DriftWm {
                 }
             }
             Action::NudgeWindow(dir) => {
-                if let Some(window) = self.focused_window().filter(|w| !w.is_widget())
+                if let Some(window) = self.focused_window().filter(|w| self.is_canvas_window(w))
                     && let Some(loc) = self.space.element_location(&window)
                 {
                     let step = self.config.nudge_step;
@@ -106,14 +108,14 @@ impl DriftWm {
                 pointer.frame(self);
             }
             Action::CenterWindow => {
-                if let Some(window) = self.focused_window().filter(|w| !w.is_widget()) {
+                if let Some(window) = self.focused_window().filter(|w| self.is_canvas_window(w)) {
                     self.navigate_to_window(&window, true);
                 } else {
                     let center = self.viewport_center_canvas();
                     let closest = self
                         .space
                         .elements()
-                        .filter(|w| !w.is_widget())
+                        .filter(|w| self.is_canvas_window(w))
                         .min_by(|a, b| {
                             let dist = |w: &smithay::desktop::Window| {
                                 let c = self.window_visual_center(w).unwrap_or_default();
@@ -132,9 +134,13 @@ impl DriftWm {
             Action::FocusCenter => {
                 let pointer = self.seat.get_pointer().unwrap();
                 let pos = pointer.current_location();
+                // Pinned windows live in screen space (no canvas position to
+                // center the camera on) — skip them here.
                 if let Some((window, _)) = self.space.element_under(pos) {
                     let window = window.clone();
-                    self.navigate_to_window(&window, true);
+                    if !self.is_pinned(&window) {
+                        self.navigate_to_window(&window, true);
+                    }
                 }
             }
             Action::CenterNearest(dir) => {
@@ -144,7 +150,7 @@ impl DriftWm {
                     Anchor(Point<f64, smithay::utils::Logical>),
                 }
 
-                let focused = self.focused_window();
+                let focused = self.focused_window().filter(|w| !self.is_pinned(w));
                 let viewport_center = self.viewport_center_canvas();
 
                 let (origin, skip) = if let Some(ref w) = focused
@@ -163,22 +169,26 @@ impl DriftWm {
                     (viewport_center, None)
                 };
 
-                let windows = self.space.elements().filter(|w| !w.is_widget()).map(|w| {
-                    let loc = self.space.element_location(w).unwrap_or_default();
-                    let size = w.geometry().size;
-                    let closest = canvas::closest_point_on_rect(origin, loc, size);
-                    let point = if closest == origin {
-                        self.window_visual_center(w).unwrap_or_else(|| {
-                            Point::from((
-                                loc.x as f64 + size.w as f64 / 2.0,
-                                loc.y as f64 + size.h as f64 / 2.0,
-                            ))
-                        })
-                    } else {
-                        closest
-                    };
-                    (NavTarget::Window(w.clone()), point)
-                });
+                let windows = self
+                    .space
+                    .elements()
+                    .filter(|w| self.is_canvas_window(w))
+                    .map(|w| {
+                        let loc = self.space.element_location(w).unwrap_or_default();
+                        let size = w.geometry().size;
+                        let closest = canvas::closest_point_on_rect(origin, loc, size);
+                        let point = if closest == origin {
+                            self.window_visual_center(w).unwrap_or_else(|| {
+                                Point::from((
+                                    loc.x as f64 + size.w as f64 / 2.0,
+                                    loc.y as f64 + size.h as f64 / 2.0,
+                                ))
+                            })
+                        } else {
+                            closest
+                        };
+                        (NavTarget::Window(w.clone()), point)
+                    });
 
                 let anchors = self
                     .config
@@ -312,11 +322,15 @@ impl DriftWm {
                 if self.try_restore_overview() {
                     // toggled back
                 } else {
-                    let windows = self.space.elements().filter(|w| !w.is_widget()).map(|w| {
-                        let loc = self.space.element_location(w).unwrap_or_default();
-                        let size = w.geometry().size;
-                        (loc, size)
-                    });
+                    let windows = self
+                        .space
+                        .elements()
+                        .filter(|w| self.is_canvas_window(w))
+                        .map(|w| {
+                            let loc = self.space.element_location(w).unwrap_or_default();
+                            let size = w.geometry().size;
+                            (loc, size)
+                        });
                     let anchors = self
                         .config
                         .nav_anchors
@@ -330,7 +344,9 @@ impl DriftWm {
             Action::ZoomToFitSnapped => {
                 if self.try_restore_overview() {
                     // toggled back
-                } else if let Some(focused) = self.focused_window().filter(|w| !w.is_widget()) {
+                } else if let Some(focused) =
+                    self.focused_window().filter(|w| self.is_canvas_window(w))
+                {
                     let rects = self.all_windows_with_snap_rects();
                     // Window's Hash/Eq are Arc pointer identity — stable despite
                     // interior mutability. Same allow as cluster_snapshot.rs.
@@ -364,17 +380,17 @@ impl DriftWm {
                 }
             }
             Action::FitWindow => {
-                if let Some(window) = self.focused_window().filter(|w| !w.is_widget()) {
+                if let Some(window) = self.focused_window().filter(|w| self.is_canvas_window(w)) {
                     self.toggle_fit_window(&window);
                 }
             }
             Action::FitWindowSnapped => {
-                if let Some(window) = self.focused_window().filter(|w| !w.is_widget()) {
+                if let Some(window) = self.focused_window().filter(|w| self.is_canvas_window(w)) {
                     self.toggle_fit_window_snapped(&window);
                 }
             }
             Action::SendToOutput(dir) => {
-                if let Some(window) = self.focused_window().filter(|w| !w.is_widget())
+                if let Some(window) = self.focused_window().filter(|w| self.is_canvas_window(w))
                     && let Some(from_output) = self.output_for_window(&window)
                     && let Some(target_output) = self.output_in_direction(&from_output, dir)
                 {
@@ -420,6 +436,9 @@ impl DriftWm {
                 });
                 self.active_layout = name;
             }
+            Action::TogglePinToScreen => {
+                self.toggle_pin_to_screen();
+            }
             Action::ReloadConfig => {
                 self.reload_config();
             }
@@ -438,6 +457,66 @@ impl DriftWm {
                 self.loop_signal.stop();
             }
         }
+    }
+
+    /// Toggle screen-pinning of the focused window. Pin/unpin keeps the window
+    /// in the same on-screen position (no visual jump) and survives reload
+    /// (state lives in `self.pinned`, not the rules).
+    fn toggle_pin_to_screen(&mut self) {
+        let Some(window) = self.focused_window() else {
+            return;
+        };
+        let Some(id) = window.wl_surface().map(|s| s.id()) else {
+            return;
+        };
+        if self.is_pinned(&window) {
+            // Unpin: convert the fixed screen position back to a canvas
+            // location at the current camera/zoom — no visual jump.
+            if let Some((output, screen_pos)) = self
+                .pinned
+                .get(&id)
+                .map(|p| (p.output.clone(), p.screen_pos))
+            {
+                let (camera, zoom) = {
+                    let os = crate::state::output_state(&output);
+                    (os.camera, os.zoom)
+                };
+                let canvas = driftwm::canvas::screen_to_canvas(
+                    driftwm::canvas::ScreenPos(screen_pos.to_f64()),
+                    camera,
+                    zoom,
+                )
+                .0
+                .to_i32_round();
+                self.space.map_element(window.clone(), canvas, true);
+            }
+            self.pinned.remove(&id);
+        } else {
+            // Pin at the window's current on-screen position on its output.
+            let Some(output) = self.output_for_window(&window) else {
+                return;
+            };
+            let Some(loc) = self.space.element_location(&window) else {
+                return;
+            };
+            let (camera, zoom) = {
+                let os = crate::state::output_state(&output);
+                (os.camera, os.zoom)
+            };
+            let screen = driftwm::canvas::canvas_to_screen(
+                driftwm::canvas::CanvasPos(loc.to_f64()),
+                camera,
+                zoom,
+            )
+            .0;
+            let screen_pos = Point::from((screen.x.round() as i32, screen.y.round() as i32));
+            // Pinned windows are out of the focus cycle.
+            self.focus_history.retain(|w| w != &window);
+            self.pinned
+                .insert(id, crate::state::PinnedState { output, screen_pos });
+        }
+        // The hit-test path changed (pinned vs canvas); recompute pointer focus.
+        self.refresh_pointer_focus();
     }
 
     /// If an overview-return is pending, animate back to it and return true.
