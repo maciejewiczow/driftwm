@@ -429,6 +429,27 @@ fn toml_background_type_without_path_falls_back_to_default() {
 }
 
 #[test]
+fn toml_background_none() {
+    let toml = r#"
+        [background]
+        type = "none"
+    "#;
+    let config = Config::from_toml(toml).unwrap();
+    assert_eq!(config.background.kind, BackgroundKind::None);
+}
+
+#[test]
+fn toml_background_none_ignores_path() {
+    let toml = r#"
+        [background]
+        type = "none"
+        path = "~/Pictures/ignored.png"
+    "#;
+    let config = Config::from_toml(toml).unwrap();
+    assert_eq!(config.background.kind, BackgroundKind::None);
+}
+
+#[test]
 fn toml_gesture_anywhere_only_not_on_window() {
     let toml = r#"
         [gestures.on-window]

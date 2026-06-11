@@ -93,6 +93,8 @@ impl CaptureBackground {
             BackgroundKind::Wallpaper(path) => {
                 wallpaper_bg(state, renderer, &path, region).unwrap_or(Self::None)
             }
+            // No built-in background: captures leave the canvas transparent.
+            BackgroundKind::None => Self::None,
         }
     }
 

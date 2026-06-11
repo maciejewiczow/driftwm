@@ -809,6 +809,10 @@ fn resolve_background_kind(
             },
             ("tile", Some(p)) => BackgroundKind::Tile(expand_tilde(&p)),
             ("wallpaper", Some(p)) => BackgroundKind::Wallpaper(expand_tilde(&p)),
+            // `path` is inapplicable here and silently ignored — like `texture`
+            // on the tile/wallpaper types. Not worth a persistent error-bar
+            // warning, since the background renders exactly as asked (nothing).
+            ("none", _) => BackgroundKind::None,
             (_, None) => {
                 collect_warn(
                     errors,

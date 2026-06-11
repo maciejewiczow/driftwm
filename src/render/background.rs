@@ -24,6 +24,9 @@ pub struct BackgroundElement {
 }
 
 enum BgKind {
+    /// `type = "none"`. A sentinel that emits nothing — present (rather than an
+    /// empty `cached_bg`) so the lazy per-frame re-init doesn't keep re-firing.
+    None,
     /// Procedural `PixelShaderElement` — dot grid or a `type = "shader"` source.
     Shader(PixelShaderElement),
     /// Image tiled across the canvas (`tile_bg.glsl`), scrolls with the camera.
@@ -70,9 +73,10 @@ impl BackgroundElement {
     }
 
     /// The render element for this frame, z-ordered as the canvas background.
-    pub fn render_element(&self, zoom: f64) -> OutputRenderElements {
+    pub fn render_element(&self, zoom: f64) -> Option<OutputRenderElements> {
         let origin = Point::<i32, Physical>::from((0, 0));
-        match &self.kind {
+        Some(match &self.kind {
+            BgKind::None => return None,
             BgKind::Shader(e) => OutputRenderElements::Background(
                 RescaleRenderElement::from_element(e.clone(), origin, zoom),
             ),
@@ -82,7 +86,7 @@ impl BackgroundElement {
             ),
             // Viewport-fixed: already in output coords, no zoom rescale.
             BgKind::Wallpaper(e) => OutputRenderElements::WallpaperBg(e.clone()),
-        }
+        })
     }
 
     /// Resize to the current viewport and refresh the uniforms each mode
@@ -91,6 +95,7 @@ impl BackgroundElement {
     fn update(&mut self, f: &BgFrame) {
         let transparent = self.transparent;
         match &mut self.kind {
+            BgKind::None => {}
             BgKind::Shader(e) => {
                 e.resize(f.canvas_area, bg_opaque_regions(transparent, f.canvas_area));
                 if f.uniforms_stale {
@@ -236,6 +241,10 @@ pub fn init_background(
                 path,
                 texture: None,
             } => shader_no_texture_dispatch(state, renderer, initial_size, output_name, &path),
+            BackgroundKind::None => {
+                init_none_bg(state, output_name);
+                Some(Ok(()))
+            }
             BackgroundKind::Default => init_shader_bg(state, renderer, initial_size, output_name),
         };
 
@@ -244,6 +253,22 @@ pub fn init_background(
         Some(Err(msg)) => state.set_error(crate::state::ErrorSource::Background, msg),
         None => {}
     }
+}
+
+/// `type = "none"`: cache a [`BgKind::None`] sentinel so the lazy re-init stops
+/// re-firing. Reset shader-mode flags so a prior animated bg stops forcing
+/// per-frame redraws.
+fn init_none_bg(state: &mut crate::state::DriftWm, output_name: &str) {
+    state.render.background_is_animated = false;
+    state.render.background_uses_camera = false;
+    state.render.background_uses_zoom = false;
+    state.render.cached_bg.insert(
+        output_name.to_string(),
+        BackgroundElement {
+            kind: BgKind::None,
+            transparent: false,
+        },
+    );
 }
 
 fn is_tiff_path(path: &str) -> bool {

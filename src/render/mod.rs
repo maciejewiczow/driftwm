@@ -1104,7 +1104,7 @@ pub fn compose_frame(
             .map(OutputRenderElements::TileBgChunk)
             .collect()
     } else if let Some(bg) = state.render.cached_bg.get(&output.name()) {
-        vec![bg.render_element(zoom)]
+        bg.render_element(zoom).into_iter().collect()
     } else {
         vec![]
     };

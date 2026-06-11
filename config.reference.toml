@@ -168,7 +168,7 @@
                                  # only refreshed when geometry/camera/static bg change)
 
 [background]
-# Three background types: "shader", "tile", "wallpaper". `path` is the source.
+# Four background types: "shader", "tile", "wallpaper", "none". `path` is the source.
 # type = "shader"
 # path = "/usr/local/share/driftwm/wallpapers/dot_grid.glsl"
 # Examples:
@@ -178,6 +178,9 @@
 # # path = "~/Pictures/Wallpapers/tile.png"
 # # type = "wallpaper" — single image fixed to viewport (does not scroll/zoom)
 # # path = "~/Pictures/Wallpapers/wallpaper.jpg"
+# # type = "none" — render no built-in background (path ignored), so a
+# #   wlr-layer-shell wallpaper daemon (swaybg, swww, mpvpaper for live video)
+# #   is the wallpaper. Launch it yourself; see docs/shaders.md.
 #
 # A "shader" can also sample an image via `texture` (bound to the shader's
 # `tex` sampler) — a procedural effect *on* your image. See docs/shaders.md.

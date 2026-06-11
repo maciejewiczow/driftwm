@@ -120,11 +120,12 @@ https://github.com/user-attachments/assets/fb1cd5a1-242c-45d7-b302-952a15aaa24d
 The background is part of the canvas — it scrolls and zooms with the viewport,
 not stuck to the screen. This gives spatial awareness when panning.
 
-Three modes (all rendered as shaders internally):
+Four modes — the first three rendered as shaders internally:
 
 - **`shader`** — procedural GLSL, animated or static, optionally sampling an image via `texture`. Default is a dot grid. See [docs/shaders.md](docs/shaders.md) to write your own. Bundled shaders live in `extras/wallpapers/{static,animated,textured}/`.
 - **`tile`** — PNG/JPG (single texture, tiled infinitely), or a tiled pyramidal TIFF for [gigapixel wallpapers](docs/gigapixel-wallpapers.md).
 - **`wallpaper`** — single image stretched to fill viewport (does not scroll/zoom) — a classic desktop wallpaper.
+- **`none`** — no built-in background, so an external `wlr-layer-shell` wallpaper daemon (`swaybg`, `swww`, `mpvpaper` for live video) becomes the wallpaper instead.
 
 > [!NOTE]
 > GPU cost scales with what a shader reads: one that reads no viewport uniforms renders once (as cheap as `wallpaper`); reading `u_camera`/`u_zoom` redraws on pan/zoom; reading `u_time` redraws every frame. Tiles redraw on pan/zoom; `wallpaper` renders once.
@@ -138,6 +139,7 @@ path = "~/.config/driftwm/bg.glsl"
 # Or: type = "tile",      path = "~/Pictures/tile.png"
 # Or: type = "tile",      path = "~/Pictures/world.tif"   # pyramidal TIFF
 # Or: type = "wallpaper", path = "~/Pictures/wallpaper.jpg"
+# Or: type = "none"                                       # external wallpaper daemon (swaybg/mpvpaper/…)
 ```
 
 ### Window rules

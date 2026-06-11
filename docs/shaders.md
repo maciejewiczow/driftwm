@@ -171,7 +171,7 @@ over the tiled image.
 
 ## Configuring the background
 
-`[background]` accepts a `type` and a `path`. Three types are supported:
+`[background]` accepts a `type` and a `path`. Four types are supported:
 
 ```toml
 # Procedural GLSL shader — scrolls with the canvas
@@ -193,10 +193,35 @@ path = "~/Pictures/tile.png"
 [background]
 type = "wallpaper"
 path = "~/Pictures/wallpaper.png"
+
+# No built-in background (no path).
+[background]
+type = "none"
 ```
 
 The `wallpaper` mode stretches the image to fill the output. Pick an image
 sized to your monitor for best results.
+
+## External wallpaper engines (`type = "none"`)
+
+`type = "none"` renders no built-in background at all, so whatever sits on the
+`wlr-layer-shell` **Background** layer becomes the wallpaper — letting you use a
+standard Wayland wallpaper daemon instead of driftwm's shader/image modes:
+
+- `swaybg` — static images
+- `swww` / `wpaperd` — animated wallpapers and transitions
+- `mpvpaper` — **live video** wallpapers (mpv on a layer surface)
+
+Launch the daemon yourself (e.g. from `autostart`); driftwm just gets out of the
+way. With nothing on the Background layer, you'll see the clear color (black).
+
+Notes:
+
+- **`path` is ignored** for this type.
+- **Not feh.** feh is X11 (it paints the X root window), which has no equivalent
+  under a Wayland compositor — use a layer-shell daemon like the ones above.
+- A live video wallpaper damages the whole screen every frame, so it repaints
+  continuously (the same cost profile as an animated shader).
 
 ## Reloading after edits
 

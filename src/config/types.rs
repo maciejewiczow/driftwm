@@ -938,6 +938,9 @@ pub enum BackgroundKind {
     Tile(String),
     /// Single image filling the viewport (fixed; does not scroll/zoom).
     Wallpaper(String),
+    /// No built-in background — render nothing so a wlr-layer-shell Background
+    /// surface (swaybg, mpvpaper, …) or the clear color is the wallpaper.
+    None,
     /// Built-in dot grid shader.
     #[default]
     Default,
