@@ -20,6 +20,31 @@ fn parse_modifiers(parts: &[&str], mod_key: ModKey) -> Result<Modifiers, String>
     Ok(mods)
 }
 
+/// True if every `+`-separated token names a modifier — a combo with no keysym,
+/// so it's a tap-modifier binding rather than a `parse_key_combo`. Modifier names
+/// are never valid keysym names, so this never shadows a real key binding.
+fn is_modifier_only(s: &str) -> bool {
+    let mut parts = s.split('+').map(str::trim).peekable();
+    parts.peek().is_some()
+        && parts.all(|p| {
+            matches!(
+                p.to_lowercase().as_str(),
+                "mod" | "alt" | "super" | "logo" | "ctrl" | "control" | "shift"
+            )
+        })
+}
+
+/// Parse a modifier-only combo like "alt+shift" into a `Modifiers` set for a
+/// tap-modifier binding. Returns `None` when `s` is not modifier-only, so the
+/// caller falls back to `parse_key_combo`.
+pub fn parse_tap_combo(s: &str, mod_key: ModKey) -> Option<Result<Modifiers, String>> {
+    if !is_modifier_only(s) {
+        return None;
+    }
+    let parts: Vec<&str> = s.split('+').map(str::trim).collect();
+    Some(parse_modifiers(&parts, mod_key))
+}
+
 /// Parse a key combo string like "Mod+Shift+Up" into a KeyCombo.
 pub fn parse_key_combo(s: &str, mod_key: ModKey) -> Result<KeyCombo, String> {
     let parts: Vec<&str> = s.split('+').map(str::trim).collect();

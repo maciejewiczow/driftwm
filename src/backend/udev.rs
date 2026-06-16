@@ -655,6 +655,7 @@ pub fn init_udev(
                     // when the session is paused.
                     data.suppressed_keys.clear();
                     data.cycle_state = None;
+                    data.tap.reset();
                 }
                 SessionEvent::ActivateSession => {
                     tracing::info!("Session resumed (VT switch back)");

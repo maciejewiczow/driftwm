@@ -74,6 +74,7 @@ use smithay::reexports::drm::control::crtc;
 
 use crate::backend::Backend;
 use crate::input::gestures::GestureState;
+use crate::input::keyboard::TapTracker;
 use driftwm::canvas::MomentumState;
 use driftwm::config::Config;
 use driftwm::window_ext::WindowExt;
@@ -478,6 +479,11 @@ pub struct DriftWm {
     pub cycle_state: Option<usize>,
 
     pub held_action: Option<(u32, driftwm::config::Action, Instant)>,
+
+    pub tap: TapTracker,
+    /// Action queued by a completed tap chord, run after the closure forwards
+    /// the modifier events so the focused client still sees them.
+    pub pending_tap_action: Option<driftwm::config::Action>,
 
     /// Keycodes whose press was intercepted by a binding. Their releases must
     /// also be intercepted, otherwise the focused client receives a "release

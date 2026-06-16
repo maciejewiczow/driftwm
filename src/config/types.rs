@@ -105,12 +105,26 @@ impl Modifiers {
         logo: false,
     };
 
-    pub(super) fn from_state(state: &ModifiersState) -> Self {
+    pub fn from_state(state: &ModifiersState) -> Self {
         Self {
             ctrl: state.ctrl,
             alt: state.alt,
             shift: state.shift,
             logo: state.logo,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::EMPTY
+    }
+
+    /// Accumulates the high-water mark of a held chord for tap-modifier bindings.
+    pub fn union(&self, other: &Self) -> Self {
+        Self {
+            ctrl: self.ctrl || other.ctrl,
+            alt: self.alt || other.alt,
+            shift: self.shift || other.shift,
+            logo: self.logo || other.logo,
         }
     }
 }

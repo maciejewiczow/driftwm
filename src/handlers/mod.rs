@@ -971,9 +971,10 @@ impl SessionLockHandler for DriftWm {
         self.held_action = None;
         self.cursor.grab_cursor = false;
         // Lock may swallow key releases and prevents focus history updates while
-        // mid-cycle; reset both so neither survives the locked window.
+        // mid-cycle; reset these so none survive the locked window.
         self.cycle_state = None;
         self.suppressed_keys.clear();
+        self.tap.reset();
         if let Some(pending) = self.pending_middle_click.take() {
             self.loop_handle.remove(pending.timer_token);
         }

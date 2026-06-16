@@ -53,6 +53,7 @@
 # remember_layout_per_window = false  # for multi-layout setups
 # variant = ""               # XKB variant (e.g., "dvorak", or "," for two defaults)
 # options = ""               # XKB options (e.g., "grp:win_space_toggle" for Super+Space layout switch)
+#                            #   grp:alt_shift_toggle/grp:ctrl_shift_toggle break those chord bindings — use a tap binding (see [keybindings]) instead
 # model = ""                 # XKB model (e.g., "pc105")
 # repeat_rate = 25           # keys/sec
 # repeat_delay = 200         # ms before repeat starts
@@ -215,6 +216,7 @@
 # Merges with defaults. Use "none" to unbind a default binding.
 # "mod" expands to mod_key. Literal modifiers: alt, super, ctrl, shift.
 # Keysyms are XKB names (case-insensitive): return, tab, up, a, equal, etc.
+# A bare modifier combo (e.g. "alt+shift") is a tap binding (fires on chord release; see [input.keyboard] options).
 #
 # Actions:
 #   exec <cmd>              — launch an app (shows loading cursor until window appears, exits fullscreen)
@@ -296,6 +298,8 @@
 # "shift+Print" = "spawn grim -g \"$(slurp -d)\" - | wl-copy"
 # Example: built-in window capture (isolated window + shadow) to clipboard
 # # "ctrl+Print" = "spawn driftwm msg screenshot window -o - | wl-copy"
+# Example: tap binding — bare modifier chord, fires on release with no key on top
+# # "alt+shift" = "switch-layout next"
 
 # Mouse bindings: "Modifier+...+Trigger" = "action"
 # Context-aware: on-window, on-canvas, anywhere.

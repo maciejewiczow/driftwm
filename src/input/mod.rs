@@ -1,6 +1,6 @@
 mod actions;
 pub(crate) mod gestures;
-mod keyboard;
+pub(crate) mod keyboard;
 mod pointer;
 
 use smithay::{
@@ -163,6 +163,20 @@ impl DriftWm {
                 _ => {}
             }
             return;
+        }
+
+        // Active pointer/gesture input on top of a held modifier chord makes it
+        // a binding prefix, not a tap — cancel any pending tap binding. Motion is
+        // passive (the cursor can drift mid-chord), so it's deliberately excluded.
+        if matches!(
+            event,
+            InputEvent::PointerButton { .. }
+                | InputEvent::PointerAxis { .. }
+                | InputEvent::GestureSwipeBegin { .. }
+                | InputEvent::GesturePinchBegin { .. }
+                | InputEvent::GestureHoldBegin { .. }
+        ) {
+            self.tap.taint();
         }
 
         match event {

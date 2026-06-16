@@ -8,6 +8,7 @@ mod types;
 pub use parse::{
     parse_action, parse_direction, parse_gesture_binding, parse_gesture_config_entry,
     parse_gesture_trigger, parse_key_combo, parse_mouse_action, parse_mouse_binding,
+    parse_tap_combo,
 };
 pub use toml::config_path;
 pub use types::*;
@@ -118,6 +119,10 @@ pub struct Config {
     pub child_env: HashMap<String, String>,
     pub output_configs: Vec<OutputConfig>,
     bindings: HashMap<KeyCombo, Action>,
+    /// Tap-modifier bindings: a bare modifier chord (e.g. `alt+shift`) that
+    /// fires its action when the chord is pressed and released with no other
+    /// key on top. Keyed by the exact modifier set.
+    tap_bindings: HashMap<Modifiers, Action>,
     pub mouse: ContextBindings<MouseBinding, MouseAction>,
     /// When `true`, resizing a window by dragging its edge (SSD or CSD
     /// border) propagates to every window connected to it via snap
@@ -143,6 +148,11 @@ impl Config {
         };
         combo.normalize();
         self.bindings.get(&combo)
+    }
+
+    /// Look up a tap-modifier binding by the completed chord's modifier set.
+    pub fn tap_lookup(&self, mods: &Modifiers) -> Option<&Action> {
+        self.tap_bindings.get(mods)
     }
 
     /// Look up a mouse button action by modifier state, button code, and context.
@@ -314,8 +324,30 @@ impl Config {
             })
             .collect();
 
+        let mut tap_bindings: HashMap<Modifiers, Action> = HashMap::new();
         if let Some(user_bindings) = raw.keybindings {
             for (key_str, action_str) in &user_bindings {
+                // A bare modifier chord (no keysym) is a tap-modifier binding.
+                if let Some(tap_result) = parse::parse_tap_combo(key_str, mod_key) {
+                    match tap_result {
+                        Ok(mods) => {
+                            if action_str == "none" {
+                                tap_bindings.remove(&mods);
+                            } else {
+                                match parse_action(action_str) {
+                                    Ok(action) => {
+                                        tap_bindings.insert(mods, action);
+                                    }
+                                    Err(e) => warn_and_collect!(
+                                        "config: invalid action '{action_str}': {e}"
+                                    ),
+                                }
+                            }
+                        }
+                        Err(e) => warn_and_collect!("config: invalid tap binding '{key_str}': {e}"),
+                    }
+                    continue;
+                }
                 match parse_key_combo(key_str, mod_key) {
                     Ok(mut combo) => {
                         combo.normalize();
@@ -491,6 +523,22 @@ impl Config {
                 model: k.model.clone().unwrap_or_default(),
             }
         };
+
+        // A group-switch xkb option bound to a modifier pair (alt+shift,
+        // ctrl+shift) rewrites the second key into a layout switch, so that
+        // exact chord never registers — a tap binding on it would silently
+        // never fire. Flag it instead of letting the user debug the silence.
+        for mods in tap_bindings.keys() {
+            if let Some(opt) = tap_option_conflict(mods, &keyboard_layout.options) {
+                warn_and_collect!(
+                    "config: tap binding '{}' will never fire while [input.keyboard] options has \
+                     {} (it consumes those modifiers for layout switching) — remove the option \
+                     and use this tap binding for layout switching instead",
+                    tap_combo_label(mods),
+                    opt,
+                );
+            }
+        }
 
         let decorations = parse_decoration_config(raw.decorations, &mut errors);
 
@@ -694,6 +742,7 @@ impl Config {
             window_placement,
             output_configs,
             bindings,
+            tap_bindings,
             mouse: mouse_bindings,
             decoration_resize_snapped,
             decoration_fit_snapped,
@@ -788,6 +837,39 @@ impl Config {
         }
         result
     }
+}
+
+/// Render a modifier set as a binding string (e.g. `alt+shift`) for messages.
+fn tap_combo_label(m: &Modifiers) -> String {
+    let mut parts = Vec::new();
+    if m.ctrl {
+        parts.push("ctrl");
+    }
+    if m.alt {
+        parts.push("alt");
+    }
+    if m.shift {
+        parts.push("shift");
+    }
+    if m.logo {
+        parts.push("super");
+    }
+    parts.join("+")
+}
+
+/// If a tap chord would be made unreachable by an xkb group-switch option in
+/// `options` (comma-separated), return the offending option token. Only
+/// modifier-*pair* toggles conflict: they turn the second modifier into a group
+/// switch, so the pair never forms a held chord. Single-key toggles
+/// (`grp:caps_toggle`, etc.) consume no modifier and so never conflict.
+fn tap_option_conflict<'a>(mods: &Modifiers, options: &'a str) -> Option<&'a str> {
+    options.split(',').map(str::trim).find(|opt| {
+        (mods.alt && mods.shift && opt.contains("alt") && opt.contains("shift"))
+            || (mods.ctrl
+                && mods.shift
+                && (opt.contains("ctrl") || opt.contains("control"))
+                && opt.contains("shift"))
+    })
 }
 
 fn resolve_background_kind(
@@ -999,5 +1081,87 @@ mod tests {
     fn remember_layout_per_window_omitted_in_toml_defaults_false() {
         let config = Config::from_toml("").unwrap();
         assert!(!config.remember_layout_per_window);
+    }
+
+    #[test]
+    fn modifier_only_keybinding_parses_as_tap() {
+        let toml_str = r#"
+            [keybindings]
+            "alt+shift" = "switch-layout next"
+        "#;
+        let config = Config::from_toml(toml_str).unwrap();
+        let mods = Modifiers {
+            alt: true,
+            shift: true,
+            ..Modifiers::EMPTY
+        };
+        assert!(matches!(
+            config.tap_lookup(&mods),
+            Some(Action::SwitchLayout(LayoutSwitch::Next))
+        ));
+    }
+
+    #[test]
+    fn normal_keybinding_is_not_a_tap() {
+        let toml_str = r#"
+            [keybindings]
+            "mod+q" = "close-window"
+        "#;
+        let config = Config::from_toml(toml_str).unwrap();
+        assert!(config.tap_bindings.is_empty());
+    }
+
+    #[test]
+    fn tap_binding_conflicting_with_xkb_option_warns() {
+        let toml_str = r#"
+            [keybindings]
+            "alt+shift" = "switch-layout next"
+
+            [input.keyboard]
+            options = "grp:alt_shift_toggle"
+        "#;
+        let (_config, warnings) = Config::from_toml_collect(toml_str).unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("grp:alt_shift_toggle") && w.contains("tap binding")),
+            "got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn tap_binding_conflict_warns_for_side_specific_toggle() {
+        // grp:lalt_lshift_toggle still consumes alt+shift — the warning names the
+        // actual option token, not a hard-coded one.
+        let toml_str = r#"
+            [keybindings]
+            "alt+shift" = "switch-layout next"
+
+            [input.keyboard]
+            options = "grp:lalt_lshift_toggle,compose:ralt"
+        "#;
+        let (_config, warnings) = Config::from_toml_collect(toml_str).unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("grp:lalt_lshift_toggle")),
+            "got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn tap_binding_with_nonconflicting_xkb_option_does_not_warn() {
+        let toml_str = r#"
+            [keybindings]
+            "alt+shift" = "switch-layout next"
+
+            [input.keyboard]
+            options = "grp:caps_toggle"
+        "#;
+        let (_config, warnings) = Config::from_toml_collect(toml_str).unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("tap binding")),
+            "got: {warnings:?}"
+        );
     }
 }

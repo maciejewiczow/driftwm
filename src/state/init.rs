@@ -48,7 +48,9 @@ use smithay::{
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
-use super::{CursorState, DriftWm, ErrorSource, RenderCache, SessionLock, client_is_unrestricted};
+use super::{
+    CursorState, DriftWm, ErrorSource, RenderCache, SessionLock, TapTracker, client_is_unrestricted,
+};
 
 impl DriftWm {
     pub fn new(
@@ -315,6 +317,8 @@ impl DriftWm {
             focus_history: Vec::new(),
             cycle_state: None,
             held_action: None,
+            tap: TapTracker::default(),
+            pending_tap_action: None,
             suppressed_keys: HashSet::new(),
             gesture_state: None,
             pending_middle_click: None,
