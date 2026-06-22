@@ -475,18 +475,18 @@ Five types: "default" (built-in dot-grid — the default), "shader", "tile", "wa
 **Example:**
 
 ```toml
-type = "shader" — procedural GLSL (scrolls with canvas)
+type = "shader"  # procedural GLSL (scrolls with canvas)
 path = "/usr/local/share/driftwm/wallpapers/animated/fast_smoke.glsl"
 
-type = "tile" — image tiled across the canvas
+type = "tile"  # image tiled across the canvas
 path = "~/Pictures/Wallpapers/tile.png"
 
-type = "wallpaper" — single image fixed to viewport (does not scroll/zoom)
+type = "wallpaper"  # single image fixed to viewport (does not scroll/zoom)
 path = "~/Pictures/Wallpapers/wallpaper.jpg"
 
-type = "none" — render no built-in background (path ignored), so a
-  wlr-layer-shell wallpaper daemon (swaybg, swww, mpvpaper for live video)
-  is the wallpaper. Launch it yourself; see docs/shaders.md.
+type = "none"  # render no built-in background (path ignored), so a
+               # wlr-layer-shell wallpaper daemon (swaybg, swww, mpvpaper for live video)
+               # is the wallpaper. Launch it yourself; see docs/shaders.md.
 ```
 
 A "shader" can also sample an image via `texture` (bound to the shader's `tex` sampler) — a procedural effect *on* your image. See docs/shaders.md.
