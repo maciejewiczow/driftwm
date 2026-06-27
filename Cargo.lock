@@ -758,6 +758,8 @@ dependencies = [
  "drm-fourcc",
  "gbm-sys",
  "libc",
+ "wayland-backend",
+ "wayland-server",
 ]
 
 [[package]]
@@ -1252,6 +1254,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
 ]
 
 [[package]]
@@ -2134,6 +2145,7 @@ dependencies = [
  "tracing",
  "tracy-client",
  "udev",
+ "wayland-backend",
  "wayland-client",
  "wayland-cursor",
  "wayland-egl",
@@ -2141,6 +2153,7 @@ dependencies = [
  "wayland-protocols-misc",
  "wayland-protocols-wlr",
  "wayland-server",
+ "wayland-sys",
  "winit",
  "xkbcommon",
 ]
@@ -2862,7 +2875,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8eab23fefc9e41f8e841df4a9c707e8a8c4ed26e944ef69297184de2785e3be"
 dependencies = [
  "dlib",
+ "libc",
  "log",
+ "memoffset",
  "once_cell",
  "pkg-config",
 ]

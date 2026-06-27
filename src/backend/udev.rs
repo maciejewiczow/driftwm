@@ -18,7 +18,7 @@ use smithay::{
         },
         egl::{EGLContext, EGLDevice, EGLDisplay, context::ContextPriority},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
-        renderer::{ImportDma, multigpu::GpuManager, multigpu::gbm::GbmGlesBackend},
+        renderer::{ImportDma, ImportEgl, multigpu::GpuManager, multigpu::gbm::GbmGlesBackend},
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
         udev::{self, UdevBackend, UdevEvent},
     },
@@ -577,6 +577,23 @@ pub fn init_udev(
 
     // 4. Store renderer on state + create DMA-BUF global
     data.backend = Some(Backend::Udev(Box::new(renderer)));
+
+    // Bind the legacy wl_drm EGL extension to the Wayland display. This enables
+    // buffer sharing for older clients and XWayland that still use wl_drm instead
+    // of zwp_linux_dmabuf_v1. Failure is expected on most modern distros where the
+    // EGL_WL_bind_wayland_display extension has been removed.
+    if let Err(err) = data
+        .backend
+        .as_mut()
+        .unwrap()
+        .renderer()
+        .bind_wl_display(&data.display_handle)
+    {
+        tracing::trace!("error binding legacy EGL to wl_display: {err}");
+    } else {
+        tracing::debug!("bound legacy EGL to wl_display");
+    }
+
     let formats = data.backend.as_mut().unwrap().renderer().dmabuf_formats();
     data.render_device = Some(render_node.dev_id());
 
