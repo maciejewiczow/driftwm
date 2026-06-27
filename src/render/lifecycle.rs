@@ -184,6 +184,96 @@ pub fn take_presentation_feedback(
     feedback
 }
 
+/// Send per-surface dmabuf feedback to all surfaces visible on `output`.
+///
+/// Must be called after `compositor.render_frame()` so that render-element
+/// states are available to distinguish scanned-out surfaces from rendered ones.
+/// Mirrors niri's `Niri::send_dmabuf_feedbacks()`. See roadmap step 6 in
+/// `Multi-GPU-PRIME.md`.
+pub fn send_dmabuf_feedbacks(
+    state: &crate::state::DriftWm,
+    output: &Output,
+    feedback: &crate::backend::udev::SurfaceDmabufFeedback,
+    states: &RenderElementStates,
+) {
+    use smithay::backend::renderer::element::utils::select_dmabuf_feedback;
+    use smithay::desktop::utils::{
+        send_dmabuf_feedback_surface_tree, surface_primary_scanout_output,
+    };
+
+    // Windows and their popups - unconditionally send the current output's
+    // feedback; windows are only on one output at a time.
+    for window in state.space.elements() {
+        window.send_dmabuf_feedback(
+            output,
+            |_, _| Some(output.clone()),
+            |surface, _| {
+                select_dmabuf_feedback(surface, states, &feedback.render, &feedback.scanout)
+            },
+        );
+    }
+
+    // Layer-shell surfaces
+    let layer_map = layer_map_for_output(output);
+    for layer_surface in layer_map.layers() {
+        layer_surface.send_dmabuf_feedback(
+            output,
+            |_, _| Some(output.clone()),
+            |surface, _| {
+                select_dmabuf_feedback(surface, states, &feedback.render, &feedback.scanout)
+            },
+        );
+    }
+    drop(layer_map);
+
+    // Canvas layers (wlr-layer-shell surfaces pinned to the canvas)
+    for cl in &state.canvas_layers {
+        cl.surface.send_dmabuf_feedback(
+            output,
+            |_, _| Some(output.clone()),
+            |surface, _| {
+                select_dmabuf_feedback(surface, states, &feedback.render, &feedback.scanout)
+            },
+        );
+    }
+
+    // Session-lock surface for this output
+    if let Some(lock_surface) = state.lock_surfaces.get(output) {
+        send_dmabuf_feedback_surface_tree(
+            lock_surface.wl_surface(),
+            output,
+            |_, _| Some(output.clone()),
+            |surface, _| {
+                select_dmabuf_feedback(surface, states, &feedback.render, &feedback.scanout)
+            },
+        );
+    }
+
+    // DnD icon — follows the pointer across outputs, so use primary-scanout filter
+    if let Some(icon) = &state.dnd_icon {
+        send_dmabuf_feedback_surface_tree(
+            &icon.surface,
+            output,
+            surface_primary_scanout_output,
+            |surface, _| {
+                select_dmabuf_feedback(surface, states, &feedback.render, &feedback.scanout)
+            },
+        );
+    }
+
+    // Client-provided cursor surface — same cross-output logic as DnD
+    if let CursorImageStatus::Surface(surface) = &state.cursor.cursor_status {
+        send_dmabuf_feedback_surface_tree(
+            surface,
+            output,
+            surface_primary_scanout_output,
+            |surface, _| {
+                select_dmabuf_feedback(surface, states, &feedback.render, &feedback.scanout)
+            },
+        );
+    }
+}
+
 /// Post-render: frame callbacks, space cleanup.
 pub fn post_render(state: &mut crate::state::DriftWm, output: &Output) {
     let time = state.start_time.elapsed();

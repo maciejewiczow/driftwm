@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use smithay::reexports::wayland_server::backend::GlobalId;
 use smithay::{
+    backend::allocator::format::FormatSet,
     backend::{
         allocator::{
             Format, Fourcc, Modifier,
@@ -23,6 +24,7 @@ use smithay::{
         udev::{self, UdevBackend, UdevEvent},
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
+    reexports::wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1,
     reexports::{
         calloop::{
             Dispatcher, EventLoop,
@@ -33,7 +35,7 @@ use smithay::{
         rustix::fs::OFlags,
     },
     utils::{DeviceFd, Transform},
-    wayland::dmabuf::DmabufFeedbackBuilder,
+    wayland::dmabuf::{DmabufFeedback, DmabufFeedbackBuilder},
 };
 
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
@@ -74,12 +76,24 @@ struct OutputDevice {
     render_node: Option<DrmNode>,
 }
 
+/// Per-output dmabuf feedback: two variants clients receive based on whether
+/// their buffer is being scanned out directly or rendered via the GPU.
+pub struct SurfaceDmabufFeedback {
+    /// Feedback for surfaces rendered by the GPU (not scanned out directly).
+    pub render: DmabufFeedback,
+    /// Feedback for surfaces that may be scanned out directly by the display.
+    pub scanout: DmabufFeedback,
+}
+
 struct BackendState {
     /// All discovered output devices keyed by their primary DRM node.
     devices: HashMap<DrmNode, OutputDevice>,
     libinput: Libinput,
     /// The primary render GPU. Surfaces on this device use the active GLES renderer.
     primary_node: DrmNode,
+    /// The EGL render node for the primary GPU. Used to build per-surface dmabuf
+    /// feedback (step 6) and to route cross-GPU rendering (step 7).
+    primary_render_node: DrmNode,
     /// Multi-GPU manager: tracks all render-capable devices as EGL nodes. Used for
     /// cross-GPU PRIME rendering (roadmap points 3+).
     gpu_manager:
@@ -108,6 +122,10 @@ struct SurfaceData {
     /// Re-applied on session resume. `Some(Some(ramp))` = set to ramp,
     /// `Some(None)` = reset to identity, `None` = nothing pending.
     pending_gamma_change: Option<Option<Vec<u16>>>,
+    /// Per-output dmabuf feedback built from primary renderer formats and
+    /// this surface's scanout-plane formats. Sent to clients after each frame
+    /// (roadmap step 6).
+    dmabuf_feedback: Option<SurfaceDmabufFeedback>,
 }
 
 /// Apply (or clear, with `None`) a gamma ramp on `surface` via whichever
@@ -346,7 +364,13 @@ pub(crate) fn render_if_needed(data: &mut DriftWm) {
                 && !data.frames_pending.contains(&crtc)
                 && !data.estimated_vblank_timers.contains_key(&crtc)
             {
-                render_frame(data, &mut surface.compositor, &surface.output, crtc);
+                render_frame(
+                    data,
+                    &mut surface.compositor,
+                    &surface.output,
+                    crtc,
+                    surface.dmabuf_feedback.as_ref(),
+                );
             }
         }
     }
@@ -679,6 +703,8 @@ pub fn init_udev(
                     &dh,
                     data,
                     &saved_output_state,
+                    render_node,
+                    primary_node,
                 ) {
                     primary_surfaces.insert(crtc, surface_data);
                 }
@@ -741,6 +767,7 @@ pub fn init_udev(
         devices: initial_devices,
         libinput,
         primary_node,
+        primary_render_node: render_node,
         gpu_manager,
     }));
 
@@ -837,7 +864,7 @@ pub fn init_udev(
                                     );
                                 }
                             }
-                            render_frame(data, &mut surface.compositor, &surface.output, crtc);
+                            render_frame(data, &mut surface.compositor, &surface.output, crtc, surface.dmabuf_feedback.as_ref());
                         }
                     }
                 }
@@ -861,6 +888,7 @@ pub fn init_udev(
                     // to primary GPU formats; create_surface will further restrict them
                     // to linear modifiers for cross-device DMA-BUF compatibility.
                     let primary_node = backend.primary_node;
+                    let hotplug_primary_render_node = backend.primary_render_node;
                     let device_render_node = backend.devices.get(&node).and_then(|d| d.render_node);
                     let hotplug_render_formats: Vec<Format> = backend
                         .devices
@@ -929,6 +957,8 @@ pub fn init_udev(
                                         &dh,
                                         data,
                                         &saved,
+                                        hotplug_primary_render_node,
+                                        node,
                                     ) {
                                         surfaces.insert(crtc, sd);
                                         data.active_outputs.insert(surfaces[&crtc].output.clone());
@@ -947,6 +977,7 @@ pub fn init_udev(
                                             &mut surface.compositor,
                                             &surface.output,
                                             crtc,
+                                            surface.dmabuf_feedback.as_ref(),
                                         );
                                     }
                                 }
@@ -1127,7 +1158,13 @@ pub fn init_udev(
         for out_dev in backend.devices.values_mut() {
             for (&crtc, surface) in out_dev.surfaces.iter_mut() {
                 data.active_outputs.insert(surface.output.clone());
-                render_frame(data, &mut surface.compositor, &surface.output, crtc);
+                render_frame(
+                    data,
+                    &mut surface.compositor,
+                    &surface.output,
+                    crtc,
+                    surface.dmabuf_feedback.as_ref(),
+                );
             }
         }
         // 14. Notify output management clients of initial state
@@ -1218,7 +1255,13 @@ fn register_drm_event_source(
                         data.loop_handle.remove(token);
                     }
                     if data.redraws_needed.contains(&surface.output) {
-                        render_frame(data, &mut surface.compositor, &surface.output, crtc);
+                        render_frame(
+                            data,
+                            &mut surface.compositor,
+                            &surface.output,
+                            crtc,
+                            surface.dmabuf_feedback.as_ref(),
+                        );
                     }
                 }
                 DrmEvent::Error(err) => {
@@ -1474,6 +1517,8 @@ fn create_surface(
         String,
         (smithay::utils::Point<f64, smithay::utils::Logical>, f64),
     >,
+    primary_render_node: DrmNode,
+    surface_scanout_node: DrmNode,
 ) -> Option<SurfaceData> {
     let connector_name = format!(
         "{}-{}",
@@ -1717,6 +1762,27 @@ fn create_surface(
         );
     }
 
+    // Build per-surface dmabuf feedback from the primary renderer formats and
+    // this surface's scanout-plane formats (roadmap step 6).
+    let dmabuf_feedback = state
+        .render_dmabuf_formats
+        .as_ref()
+        .and_then(|primary_formats| {
+            match surface_dmabuf_feedback(
+                &compositor,
+                primary_formats.clone(),
+                primary_render_node,
+                device_render_node,
+                surface_scanout_node,
+            ) {
+                Ok(fb) => Some(fb),
+                Err(err) => {
+                    tracing::warn!("error building dmabuf feedback for {connector_name}: {err:?}");
+                    None
+                }
+            }
+        });
+
     Some(SurfaceData {
         compositor,
         output,
@@ -1727,7 +1793,83 @@ fn create_surface(
         global,
         gamma_props,
         pending_gamma_change: None,
+        dmabuf_feedback,
     })
+}
+
+/// Build per-output dmabuf feedback so clients know which formats and modifiers
+/// can be scanned out directly vs. must be rendered through the GPU.
+///
+/// Mirrors niri's `surface_dmabuf_feedback()`. See roadmap step 6 in
+/// `Multi-GPU-PRIME.md` for design rationale.
+fn surface_dmabuf_feedback(
+    compositor: &GbmDrmCompositor,
+    primary_formats: FormatSet,
+    primary_render_node: DrmNode,
+    surface_render_node: Option<DrmNode>,
+    surface_scanout_node: DrmNode,
+) -> Result<SurfaceDmabufFeedback, std::io::Error> {
+    let surface = compositor.surface();
+    let planes = surface.planes();
+
+    let primary_plane_formats = surface.plane_info().formats.clone();
+    let primary_or_overlay_plane_formats = primary_plane_formats
+        .iter()
+        .chain(planes.overlay.iter().flat_map(|p| p.formats.iter()))
+        .copied()
+        .collect::<FormatSet>();
+
+    // Intersect scanout-compatible formats with primary renderer formats so
+    // there is always a fallback render path if direct scanout fails.
+    let mut primary_scanout_formats = primary_plane_formats
+        .intersection(&primary_formats)
+        .copied()
+        .collect::<Vec<_>>();
+    let mut primary_or_overlay_scanout_formats = primary_or_overlay_plane_formats
+        .intersection(&primary_formats)
+        .copied()
+        .collect::<Vec<_>>();
+
+    // On cross-GPU paths (and display-only devices without a render node),
+    // restrict to linear modifiers for DMA-BUF cross-device compatibility.
+    if surface_render_node != Some(primary_render_node) {
+        primary_scanout_formats.retain(|f| f.modifier == Modifier::Linear);
+        primary_or_overlay_scanout_formats.retain(|f| f.modifier == Modifier::Linear);
+    }
+
+    let builder = DmabufFeedbackBuilder::new(primary_render_node.dev_id(), primary_formats);
+
+    tracing::trace!(
+        "dmabuf feedback: {} primary-plane formats, {} primary-or-overlay formats",
+        primary_scanout_formats.len(),
+        primary_or_overlay_scanout_formats.len(),
+    );
+
+    // Prefer primary-plane-only formats first, then add overlay-capable formats.
+    // This maximises the chance of direct scanout with overlay planes disabled by default.
+    let scanout = builder
+        .clone()
+        .add_preference_tranche(
+            surface_scanout_node.dev_id(),
+            Some(zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout),
+            primary_scanout_formats,
+        )
+        .add_preference_tranche(
+            surface_scanout_node.dev_id(),
+            Some(zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout),
+            primary_or_overlay_scanout_formats,
+        )
+        .build()?;
+
+    // On the primary GPU path the render and scanout feedbacks are the same
+    // (the surface is both rendered and scanned out on the same device).
+    let render = if surface_render_node == Some(primary_render_node) {
+        scanout.clone()
+    } else {
+        builder.build()?
+    };
+
+    Ok(SurfaceDmabufFeedback { render, scanout })
 }
 
 /// Tear down a `wl_output` global. Disables it now so clients see the
@@ -1867,6 +2009,7 @@ fn render_frame(
     compositor: &mut GbmDrmCompositor,
     output: &Output,
     crtc: crtc::Handle,
+    dmabuf_feedback: Option<&SurfaceDmabufFeedback>,
 ) {
     #[cfg(feature = "profile-with-tracy")]
     let _span = tracy_client::span!("udev::render_frame");
@@ -2002,6 +2145,9 @@ fn render_frame(
     match render_result {
         Ok(render_result) => {
             crate::render::update_primary_scanout_output(data, output, &render_result.states);
+            if let Some(feedback) = dmabuf_feedback {
+                crate::render::send_dmabuf_feedbacks(data, output, feedback, &render_result.states);
+            }
             let feedback =
                 crate::render::take_presentation_feedback(data, output, &render_result.states);
             let queue_result = {
