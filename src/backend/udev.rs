@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -60,14 +60,28 @@ type GbmDrmCompositor = DrmCompositor<
     DrmDeviceFd,
 >;
 
-struct DeviceData {
+struct OutputDevice {
     drm: DrmDevice,
     gbm: GbmDevice<DrmDeviceFd>,
     drm_scanner: DrmScanner,
     surfaces: HashMap<crtc::Handle, SurfaceData>,
     render_formats: Vec<Format>,
-    libinput: Libinput,
 }
+
+struct BackendState {
+    /// All discovered output devices keyed by their primary DRM node.
+    devices: HashMap<DrmNode, OutputDevice>,
+    libinput: Libinput,
+    /// The primary render GPU. Surfaces on this device use the active GLES renderer.
+    primary_node: DrmNode,
+}
+
+/// Opaque handle to udev backend state. Returned by init_udev,
+/// stored on `DriftWm::udev_device` (single owner). Rc-cloneable so the
+/// render loop and gamma-control handler can each grab an independent
+/// `RefCell` borrow without re-routing through DriftWm.
+#[derive(Clone)]
+pub(crate) struct UdevDevice(Rc<RefCell<BackendState>>);
 
 struct SurfaceData {
     compositor: GbmDrmCompositor,
@@ -85,13 +99,6 @@ struct SurfaceData {
     /// `Some(None)` = reset to identity, `None` = nothing pending.
     pending_gamma_change: Option<Option<Vec<u16>>>,
 }
-
-/// Opaque handle to udev backend device data. Returned by init_udev,
-/// stored on `DriftWm::udev_device` (single owner). Rc-cloneable so the
-/// render loop and gamma-control handler can each grab an independent
-/// `RefCell` borrow without re-routing through DriftWm.
-#[derive(Clone)]
-pub(crate) struct UdevDevice(Rc<RefCell<DeviceData>>);
 
 /// Apply (or clear, with `None`) a gamma ramp on `surface` via whichever
 /// path the CRTC supports — atomic GAMMA_LUT first, legacy ioctl fallback.
@@ -116,14 +123,18 @@ impl UdevDevice {
     /// advertising a 0-entry LUT.
     pub(crate) fn get_gamma_size(&self, output: &Output) -> Option<u32> {
         use smithay::reexports::drm::control::Device as _;
-        let dev = self.0.borrow();
-        let (crtc, surface) = dev.surfaces.iter().find(|(_, s)| s.output == *output)?;
-        let size = if let Some(gp) = &surface.gamma_props {
-            gp.gamma_size(&dev.drm)?
-        } else {
-            dev.drm.get_crtc(*crtc).ok()?.gamma_length()
-        };
-        (size != 0).then_some(size)
+        let backend = self.0.borrow();
+        for dev in backend.devices.values() {
+            if let Some((crtc, surface)) = dev.surfaces.iter().find(|(_, s)| s.output == *output) {
+                let size = if let Some(gp) = &surface.gamma_props {
+                    gp.gamma_size(&dev.drm)?
+                } else {
+                    dev.drm.get_crtc(*crtc).ok()?.gamma_length()
+                };
+                return (size != 0).then_some(size);
+            }
+        }
+        None
     }
 
     /// Apply a gamma ramp (or reset to identity if `None`). Atomic path if
@@ -131,8 +142,12 @@ impl UdevDevice {
     /// is inactive (VT switched away), the ramp is queued on the surface
     /// and re-applied on resume.
     pub(crate) fn set_gamma(&self, output: &Output, ramp: Option<Vec<u16>>) -> Option<()> {
-        let mut dev = self.0.borrow_mut();
-        let DeviceData { drm, surfaces, .. } = &mut *dev;
+        let mut backend = self.0.borrow_mut();
+        let dev = backend
+            .devices
+            .values_mut()
+            .find(|d| d.surfaces.values().any(|s| s.output == *output))?;
+        let OutputDevice { drm, surfaces, .. } = dev;
         let (crtc, surface) = surfaces.iter_mut().find(|(_, s)| s.output == *output)?;
 
         if !drm.is_active() {
@@ -193,7 +208,12 @@ pub(crate) fn render_if_needed(data: &mut DriftWm) {
     // Skip all rendering when DRM is paused (VT switch away). Without this the
     // event loop wakes constantly on client commits and spam-retries render,
     // pegging a CPU and starving the rest of the system.
-    if !dev.drm.is_active() {
+    let primary_node = dev.primary_node;
+    if !dev
+        .devices
+        .get(&primary_node)
+        .map_or(false, |d| d.drm.is_active())
+    {
         return;
     }
 
@@ -202,7 +222,17 @@ pub(crate) fn render_if_needed(data: &mut DriftWm) {
     if !data.pending_dpms.is_empty() {
         let pending: Vec<(Output, bool)> = data.pending_dpms.drain().collect();
         for (output, on) in &pending {
-            let Some((&crtc, surface)) = dev.surfaces.iter_mut().find(|(_, s)| s.output == *output)
+            let Some(out_dev) = dev
+                .devices
+                .values_mut()
+                .find(|d| d.surfaces.values().any(|s| s.output == *output))
+            else {
+                continue;
+            };
+            let Some((&crtc, surface)) = out_dev
+                .surfaces
+                .iter_mut()
+                .find(|(_, s)| s.output == *output)
             else {
                 continue;
             };
@@ -228,27 +258,29 @@ pub(crate) fn render_if_needed(data: &mut DriftWm) {
     }
 
     // Mark outputs dirty for per-output animations.
-    for (_, surface) in dev.surfaces.iter() {
-        if data.dpms_off_outputs.contains(&surface.output) {
-            continue;
-        }
-        if data.output_has_active_animations(&surface.output) {
-            data.redraws_needed.insert(surface.output.clone());
-        }
-        // Chunked-bg with tiles still to upload: keep firing frames until the
-        // visible set fully resolves. Otherwise the loop idles after pan
-        // stops and blurry chunks stay covered by the fallback plane until
-        // unrelated damage (cursor, animation, client commit) wakes us.
-        if let Some(cache) = data.render.cached_tile_chunks.get(&surface.output.name())
-            && cache.has_pending_loads()
-        {
-            data.redraws_needed.insert(surface.output.clone());
-        }
-        // Same for chunked shader-bake: refine sharp chunks after pan stops.
-        if let Some(cache) = data.render.cached_shader_chunks.get(&surface.output.name())
-            && cache.has_pending_bakes()
-        {
-            data.redraws_needed.insert(surface.output.clone());
+    for out_dev in dev.devices.values() {
+        for (_, surface) in &out_dev.surfaces {
+            if data.dpms_off_outputs.contains(&surface.output) {
+                continue;
+            }
+            if data.output_has_active_animations(&surface.output) {
+                data.redraws_needed.insert(surface.output.clone());
+            }
+            // Chunked-bg with tiles still to upload: keep firing frames until the
+            // visible set fully resolves. Otherwise the loop idles after pan
+            // stops and blurry chunks stay covered by the fallback plane until
+            // unrelated damage (cursor, animation, client commit) wakes us.
+            if let Some(cache) = data.render.cached_tile_chunks.get(&surface.output.name())
+                && cache.has_pending_loads()
+            {
+                data.redraws_needed.insert(surface.output.clone());
+            }
+            // Same for chunked shader-bake: refine sharp chunks after pan stops.
+            if let Some(cache) = data.render.cached_shader_chunks.get(&surface.output.name())
+                && cache.has_pending_bakes()
+            {
+                data.redraws_needed.insert(surface.output.clone());
+            }
         }
     }
 
@@ -278,16 +310,13 @@ pub(crate) fn render_if_needed(data: &mut DriftWm) {
     // re-broadcast reflects the new mode state. Mode changes either come from
     // wlr-output-management Apply or from config reload.
     if !data.pending_mode_changes.is_empty() {
-        // Borrow-split: iter_mut on `surfaces` reborrows the whole RefMut.
-        // Same pattern as the hotplug callback at line ~527.
-        let DeviceData { drm, surfaces, .. } = &mut *dev;
-        apply_pending_mode_changes(drm, surfaces, data);
+        apply_pending_mode_changes(&mut dev.devices, data);
     }
 
     // 4b. Re-notify output management clients after apply_output_config
     if data.output_config_dirty {
         data.output_config_dirty = false;
-        let head_state = collect_output_state_from_surfaces(&dev.surfaces, &dev.drm);
+        let head_state = collect_output_state_from_devices(&dev.devices);
         driftwm::protocols::output_management::notify_changes::<DriftWm>(
             &mut data.output_management_state,
             head_state,
@@ -295,18 +324,20 @@ pub(crate) fn render_if_needed(data: &mut DriftWm) {
     }
 
     // Render outputs that need it.
-    for (&crtc, surface) in dev.surfaces.iter_mut() {
-        if data.dpms_off_outputs.contains(&surface.output) {
-            data.redraws_needed.remove(&surface.output);
-            continue;
-        }
-        // An armed estimated-VBlank timer counts as waiting, like frames_pending:
-        // re-rendering before either resolves spins render_frame past refresh rate.
-        if data.redraws_needed.contains(&surface.output)
-            && !data.frames_pending.contains(&crtc)
-            && !data.estimated_vblank_timers.contains_key(&crtc)
-        {
-            render_frame(data, &mut surface.compositor, &surface.output, crtc);
+    for out_dev in dev.devices.values_mut() {
+        for (&crtc, surface) in out_dev.surfaces.iter_mut() {
+            if data.dpms_off_outputs.contains(&surface.output) {
+                data.redraws_needed.remove(&surface.output);
+                continue;
+            }
+            // An armed estimated-VBlank timer counts as waiting, like frames_pending:
+            // re-rendering before either resolves spins render_frame past refresh rate.
+            if data.redraws_needed.contains(&surface.output)
+                && !data.frames_pending.contains(&crtc)
+                && !data.estimated_vblank_timers.contains_key(&crtc)
+            {
+                render_frame(data, &mut surface.compositor, &surface.output, crtc);
+            }
         }
     }
 }
@@ -321,17 +352,40 @@ pub fn init_udev(
     let seat_name = session.seat();
     tracing::info!("Session created on seat: {seat_name}");
     tracing::info!(
-        "Backend config: wait_for_frame_completion={}, disable_direct_scanout={}, disable_hardware_cursor={}",
+        "Backend config: wait_for_frame_completion={}, disable_direct_scanout={}, disable_hardware_cursor={}{}",
         data.config.backend.wait_for_frame_completion,
         data.config.backend.disable_direct_scanout,
         data.config.backend.disable_hardware_cursor,
+        data.config
+            .backend
+            .render_drm_device
+            .as_ref()
+            .map(|p| format!(", render_drm_device={}", p.display()))
+            .unwrap_or_default(),
     );
 
     // 2. Enumerate GPUs — UdevBackend gives us all DRM devices (also used for hotplug later)
     let udev_backend = UdevBackend::new(&seat_name)?;
-    let primary_gpu_path = udev::primary_gpu(&seat_name).ok().flatten();
+
+    // Determine the primary GPU: prefer an explicit config override, then fall
+    // back to what udev reports as the session's primary GPU. The path here is
+    // the KMS/primary node (e.g. /dev/dri/card0), not the render node.
+    let primary_gpu_path: Option<PathBuf> = primary_node_from_config(&data.config)
+        .and_then(|(primary_node, _)| primary_node.dev_path())
+        .or_else(|| udev::primary_gpu(&seat_name).ok().flatten());
     if let Some(ref p) = primary_gpu_path {
-        tracing::info!("System primary GPU: {}", p.display());
+        tracing::info!("Primary GPU: {}", p.display());
+    }
+
+    // Compute the ignore list from config. Paths in `ignore_drm_devices` are
+    // resolved to DrmNodes (both primary and render) and filtered from discovery.
+    // The primary render node is always excluded from the ignore list.
+    let (primary_node_hint, primary_render_node_hint) =
+        primary_node_from_config(&data.config).unzip();
+    let ignored_nodes =
+        compute_ignored_nodes(&data.config, primary_node_hint, primary_render_node_hint);
+    if !ignored_nodes.is_empty() {
+        tracing::info!("Ignored DRM nodes: {ignored_nodes:?}");
     }
 
     // Build ordered candidate list: primary GPU first, then all others.
@@ -356,10 +410,18 @@ pub fn init_udev(
         return Err("No GPUs found".into());
     }
 
-    // 3. Try each GPU until one has connected displays
+    // 3. Initialize the primary GPU: find the first candidate with connected displays.
     let open_flags = OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK;
 
-    let (mut drm, drm_notifier, gbm, renderer, render_formats, render_node) = 'found: {
+    let (
+        primary_node,
+        mut primary_drm,
+        primary_drm_notifier,
+        primary_gbm,
+        renderer,
+        render_formats,
+        render_node,
+    ) = 'found: {
         for path in &gpu_paths {
             let node = match DrmNode::from_path(path) {
                 Ok(n) => n,
@@ -370,6 +432,10 @@ pub fn init_udev(
             };
             if node.ty() != NodeType::Primary {
                 tracing::debug!("{}: not a primary node, skipping", path.display());
+                continue;
+            }
+            if ignored_nodes.contains(&node) {
+                tracing::info!("{}: in ignore list, skipping", path.display());
                 continue;
             }
 
@@ -480,8 +546,9 @@ pub fn init_udev(
                     node
                 });
 
-            tracing::info!("Using GPU: {}", path.display());
+            tracing::info!("Using primary GPU: {}", path.display());
             break 'found (
+                node,
                 drm,
                 drm_notifier,
                 gbm,
@@ -537,12 +604,12 @@ pub fn init_udev(
     // Store session on state so keyboard handler can call change_vt()
     data.session = Some(session);
 
-    // 6. Scan connectors and set up outputs
-    log_drm_connectors(&drm);
+    // 6. Scan connectors on the primary GPU and set up output surfaces
+    log_drm_connectors(&primary_drm);
 
-    let mut drm_scanner = DrmScanner::new();
-    let scan_result = drm_scanner.scan_connectors(&drm)?;
-    let mut device_surfaces: HashMap<crtc::Handle, SurfaceData> = HashMap::new();
+    let mut primary_drm_scanner = DrmScanner::new();
+    let scan_result = primary_drm_scanner.scan_connectors(&primary_drm)?;
+    let mut primary_surfaces: HashMap<crtc::Handle, SurfaceData> = HashMap::new();
     let saved_output_state = crate::state::read_all_per_output_state();
 
     for event in scan_result {
@@ -559,8 +626,8 @@ pub fn init_udev(
                 );
                 let dh = data.display_handle.clone();
                 if let Some(surface_data) = create_surface(
-                    &mut drm,
-                    &gbm,
+                    &mut primary_drm,
+                    &primary_gbm,
                     &render_formats,
                     &connector,
                     crtc,
@@ -568,7 +635,7 @@ pub fn init_udev(
                     data,
                     &saved_output_state,
                 ) {
-                    device_surfaces.insert(crtc, surface_data);
+                    primary_surfaces.insert(crtc, surface_data);
                 }
             }
             DrmScanEvent::Connected {
@@ -593,12 +660,11 @@ pub fn init_udev(
         }
     }
 
-    if device_surfaces.is_empty() {
+    if primary_surfaces.is_empty() {
         return Err("Display connected but failed to create DRM surfaces".into());
     }
 
     // 7. Compile background shader / load tile (shared with winit)
-    // Uses first surface's mode for initial background element size (resized per-frame anyway)
     {
         let mut backend = data.backend.take().unwrap();
         data.render.shadow_shader = crate::render::compile_shadow_shader(backend.renderer());
@@ -613,60 +679,45 @@ pub fn init_udev(
         data.backend = Some(backend);
     }
 
-    // 8. Build shared device state (Rc<RefCell<>> for safe sharing across calloop closures)
-    let device = Rc::new(RefCell::new(DeviceData {
-        drm,
-        gbm,
-        drm_scanner,
-        surfaces: device_surfaces,
+    // 8. Build shared backend state. Start with just the primary device; secondary
+    //    devices are added below. Rc<RefCell<>> for safe sharing across calloop closures.
+    let primary_output_device = OutputDevice {
+        drm: primary_drm,
+        gbm: primary_gbm,
+        drm_scanner: primary_drm_scanner,
+        surfaces: primary_surfaces,
         render_formats,
+    };
+    let mut initial_devices: HashMap<DrmNode, OutputDevice> = HashMap::new();
+    initial_devices.insert(primary_node, primary_output_device);
+
+    let backend_state = Rc::new(RefCell::new(BackendState {
+        devices: initial_devices,
         libinput,
+        primary_node,
     }));
 
-    // 9. Register DRM event source (VBlank handler)
-    let device_for_drm = Rc::clone(&device);
-    event_loop
-        .handle()
-        .insert_source(drm_notifier, move |event, meta, data: &mut DriftWm| {
-            let mut dev = device_for_drm.borrow_mut();
-            match event {
-                DrmEvent::VBlank(crtc) => {
-                    let Some(surface) = dev.surfaces.get_mut(&crtc) else {
-                        return;
-                    };
-                    match surface.compositor.frame_submitted() {
-                        Ok(Some(mut feedback)) => {
-                            deliver_presentation(&mut feedback, &surface.output, meta.as_ref());
-                        }
-                        Ok(None) => {}
-                        Err(e) => tracing::warn!("frame_submitted error: {e:?}"),
-                    }
-                    data.frames_pending.remove(&crtc);
-                    // Real VBlank beat any estimated-VBlank timer we might have armed.
-                    if let Some(token) = data.estimated_vblank_timers.remove(&crtc) {
-                        data.loop_handle.remove(token);
-                    }
-                    if data.redraws_needed.contains(&surface.output) {
-                        render_frame(data, &mut surface.compositor, &surface.output, crtc);
-                    }
-                }
-                DrmEvent::Error(err) => {
-                    tracing::error!("DRM error: {err}");
-                }
-            }
-        })?;
+    // 9. Register DRM event source for the primary device (VBlank handler)
+    register_drm_event_source(
+        &event_loop.handle(),
+        &backend_state,
+        primary_node,
+        primary_drm_notifier,
+    )?;
 
     // 10. Register session notifier (VT switching)
-    let device_for_session = Rc::clone(&device);
+    let backend_for_session = Rc::clone(&backend_state);
     event_loop
         .handle()
         .insert_source(session_notifier, move |event, _, data: &mut DriftWm| {
-            let mut dev = device_for_session.borrow_mut();
+            let mut backend = backend_for_session.borrow_mut();
             match event {
                 SessionEvent::PauseSession => {
                     tracing::info!("Session paused (VT switch away)");
-                    dev.libinput.suspend();
-                    dev.drm.pause();
+                    backend.libinput.suspend();
+                    for out_dev in backend.devices.values_mut() {
+                        out_dev.drm.pause();
+                    }
                     for (_, token) in data.estimated_vblank_timers.drain() {
                         data.loop_handle.remove(token);
                     }
@@ -678,11 +729,27 @@ pub fn init_udev(
                 }
                 SessionEvent::ActivateSession => {
                     tracing::info!("Session resumed (VT switch back)");
-                    if dev.libinput.resume().is_err() {
+                    if backend.libinput.resume().is_err() {
                         tracing::warn!("Failed to resume libinput");
                     }
-                    if let Err(e) = dev.drm.activate(false) {
-                        tracing::error!("Failed to activate DRM: {e}");
+                    let primary_node = backend.primary_node;
+                    let primary_activated = backend
+                        .devices
+                        .get_mut(&primary_node)
+                        .and_then(|d| d.drm.activate(false).ok());
+                    if primary_activated.is_none() {
+                        tracing::error!("Failed to activate primary DRM device");
+                        // Still try to activate secondary devices.
+                    }
+                    for (node, out_dev) in backend.devices.iter_mut() {
+                        if *node == primary_node {
+                            continue;
+                        }
+                        if let Err(e) = out_dev.drm.activate(false) {
+                            tracing::warn!("Failed to activate secondary DRM device: {e}");
+                        }
+                    }
+                    if primary_activated.is_none() {
                         return;
                     }
                     // VBlanks for pre-switch frames never arrive
@@ -696,55 +763,63 @@ pub fn init_udev(
                     data.dpms_off_outputs.clear();
                     data.pending_dpms.clear();
                     driftwm::protocols::output_power::OutputPowerState::refresh(data);
-                    let DeviceData { drm, surfaces, .. } = &mut *dev;
-                    for (&crtc, surface) in surfaces.iter_mut() {
-                        if let Err(e) = surface.compositor.reset_state() {
-                            tracing::warn!("Failed to reset DRM surface state: {e}");
-                        }
-                        let _ = surface.compositor.frame_submitted();
-                        if let Some(ramp) = surface.pending_gamma_change.take() {
-                            if apply_gamma(surface, drm, crtc, ramp.as_deref()).is_none() {
-                                tracing::warn!(
-                                    "failed to re-apply gamma on session resume for crtc {crtc:?}"
-                                );
+                    for out_dev in backend.devices.values_mut() {
+                        let OutputDevice { drm, surfaces, .. } = out_dev;
+                        for (&crtc, surface) in surfaces.iter_mut() {
+                            if let Err(e) = surface.compositor.reset_state() {
+                                tracing::warn!("Failed to reset DRM surface state: {e}");
                             }
-                        } else if let Some(gp) = &mut surface.gamma_props
-                            && gp.has_previous_blob()
-                        {
-                            // VT switch clears CRTC gamma to default. Re-apply
-                            // the last-set blob so a tint set before the switch
-                            // doesn't silently vanish until the client re-polls.
-                            // Legacy path has no equivalent — kernel doesn't
-                            // retain the ramp and we don't shadow it.
-                            if gp.restore_gamma(drm).is_none() {
-                                tracing::warn!(
-                                    "failed to restore gamma on session resume for crtc {crtc:?}"
-                                );
+                            let _ = surface.compositor.frame_submitted();
+                            if let Some(ramp) = surface.pending_gamma_change.take() {
+                                if apply_gamma(surface, drm, crtc, ramp.as_deref()).is_none() {
+                                    tracing::warn!(
+                                        "failed to re-apply gamma on session resume for crtc {crtc:?}"
+                                    );
+                                }
+                            } else if let Some(gp) = &mut surface.gamma_props
+                                && gp.has_previous_blob()
+                            {
+                                // VT switch clears CRTC gamma to default. Re-apply
+                                // the last-set blob so a tint set before the switch
+                                // doesn't silently vanish until the client re-polls.
+                                // Legacy path has no equivalent — kernel doesn't
+                                // retain the ramp and we don't shadow it.
+                                if gp.restore_gamma(drm).is_none() {
+                                    tracing::warn!(
+                                        "failed to restore gamma on session resume for crtc {crtc:?}"
+                                    );
+                                }
                             }
+                            render_frame(data, &mut surface.compositor, &surface.output, crtc);
                         }
-                        render_frame(data, &mut surface.compositor, &surface.output, crtc);
                     }
                 }
             }
         })?;
 
-    // 11. Register udev backend for hotplug
-    let device_for_hotplug = Rc::clone(&device);
+    // 11. Register udev backend for hotplug and secondary device discovery
+    let backend_for_hotplug = Rc::clone(&backend_state);
     let udev_dispatcher = Dispatcher::new(
         udev_backend,
         move |event: UdevEvent, _, data: &mut DriftWm| {
-            let mut dev = device_for_hotplug.borrow_mut();
+            let mut backend = backend_for_hotplug.borrow_mut();
             match event {
                 UdevEvent::Changed { device_id } => {
                     tracing::debug!("Udev device changed: {device_id:?}");
-                    let DeviceData {
+                    let Ok(node) = DrmNode::from_dev_id(device_id) else {
+                        return;
+                    };
+                    let Some(out_dev) = backend.devices.get_mut(&node) else {
+                        return;
+                    };
+                    let OutputDevice {
                         ref mut drm_scanner,
                         ref mut drm,
                         ref gbm,
                         ref render_formats,
                         ref mut surfaces,
                         ..
-                    } = *dev;
+                    } = *out_dev;
                     if let Ok(scan_result) = drm_scanner.scan_connectors(&*drm) {
                         for scan_event in scan_result {
                             match scan_event {
@@ -830,39 +905,304 @@ pub fn init_udev(
                         }
                     }
                     // Notify output management clients after hotplug changes
-                    let head_state = collect_output_state_from_surfaces(surfaces, drm);
+                    let head_state = collect_output_state_from_devices(&backend.devices);
                     driftwm::protocols::output_management::notify_changes::<DriftWm>(
                         &mut data.output_management_state,
                         head_state,
                     );
                 }
-                UdevEvent::Added { device_id: _, path } => {
-                    tracing::info!("Udev device added: {path:?} (ignoring — single GPU)");
+                UdevEvent::Added { device_id, path } => {
+                    tracing::info!("Udev device added: {path:?}");
+                    // Only process primary-type DRM nodes as output providers.
+                    // https://gitlab.freedesktop.org/wlroots/wlroots/-/commit/768fbaad54027f8dd027e7e015e8eeb93cb38c52
+                    let node = match DrmNode::from_dev_id(device_id) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            tracing::debug!("device {device_id}: not a DRM node ({e}), skipping");
+                            return;
+                        }
+                    };
+                    if node.ty() != NodeType::Primary {
+                        tracing::debug!("{path:?}: not a primary node, skipping");
+                        return;
+                    }
+                    // Skip nodes that are already tracked.
+                    if backend.devices.contains_key(&node) {
+                        tracing::debug!("{path:?}: already tracked, skipping");
+                        return;
+                    }
+                    // Skip ignored nodes (config-based ignore list).
+                    let ignored =
+                        compute_ignored_nodes(&data.config, Some(backend.primary_node), None);
+                    if ignored.contains(&node) {
+                        tracing::info!("{path:?}: in ignore list, skipping");
+                        return;
+                    }
+                    let open_flags =
+                        OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK;
+                    let session = data.session.as_mut().unwrap();
+                    match try_open_secondary_device(session, &path, open_flags) {
+                        Some((drm, drm_notifier, gbm)) => {
+                            tracing::info!("Secondary GPU discovered: {path:?}");
+                            let out_dev = OutputDevice {
+                                drm,
+                                gbm,
+                                drm_scanner: DrmScanner::new(),
+                                surfaces: HashMap::new(),
+                                render_formats: Vec::new(),
+                            };
+                            backend.devices.insert(node, out_dev);
+                            if let Err(e) = register_drm_event_source(
+                                &data.loop_handle,
+                                &backend_for_hotplug,
+                                node,
+                                drm_notifier,
+                            ) {
+                                tracing::warn!(
+                                    "Failed to register DRM event source for {path:?}: {e}"
+                                );
+                            }
+                        }
+                        None => {
+                            tracing::warn!("Could not open secondary GPU {path:?}");
+                        }
+                    }
                 }
                 UdevEvent::Removed { device_id } => {
                     tracing::info!("Udev device removed: {device_id:?}");
+                    let Ok(node) = DrmNode::from_dev_id(device_id) else {
+                        return;
+                    };
+                    if backend.devices.remove(&node).is_some() {
+                        tracing::info!("Removed output device for node {node:?}");
+                    }
                 }
             }
         },
     );
     event_loop.handle().register_dispatcher(udev_dispatcher)?;
 
-    // 12. Seed active_outputs and queue initial render
+    // 12. Discover secondary GPUs. These are all non-primary DRM primary nodes
+    //     not in the ignore list. We open them and track them; surfaces will be
+    //     created when GpuManager support is added (roadmap point 3).
+    let secondary_paths: Vec<PathBuf> = udev_backend_device_paths(&backend_state.borrow())
+        .into_iter()
+        .filter(|path| {
+            DrmNode::from_path(path)
+                .ok()
+                .map_or(true, |n| n != primary_node && !ignored_nodes.contains(&n))
+        })
+        .collect();
+
+    // Re-enumerate from udev since we consumed it into the dispatcher.
+    // We use a second UdevBackend scan to get the device list.
     {
-        let mut dev = device.borrow_mut();
-        for (&crtc, surface) in dev.surfaces.iter_mut() {
-            data.active_outputs.insert(surface.output.clone());
-            render_frame(data, &mut surface.compositor, &surface.output, crtc);
+        // We can't access the udev_dispatcher after registering it, so we
+        // directly iterate the already-known gpu_paths for secondary discovery.
+        let session = data.session.as_mut().unwrap();
+        for path in &gpu_paths {
+            let node = match DrmNode::from_path(path) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            // Skip: already added as primary, not a primary node, or in ignore list
+            if node == primary_node
+                || node.ty() != NodeType::Primary
+                || ignored_nodes.contains(&node)
+            {
+                continue;
+            }
+            match try_open_secondary_device(session, path, open_flags) {
+                Some((drm, drm_notifier, gbm)) => {
+                    tracing::info!("Secondary GPU: {}", path.display());
+                    let out_dev = OutputDevice {
+                        drm,
+                        gbm,
+                        drm_scanner: DrmScanner::new(),
+                        surfaces: HashMap::new(),
+                        render_formats: Vec::new(),
+                    };
+                    backend_state.borrow_mut().devices.insert(node, out_dev);
+                    register_drm_event_source(
+                        &event_loop.handle(),
+                        &backend_state,
+                        node,
+                        drm_notifier,
+                    )?;
+                }
+                None => {
+                    tracing::warn!("Could not open secondary GPU: {}", path.display());
+                }
+            }
         }
-        // 13. Notify output management clients of initial state
-        let head_state = collect_output_state_from_surfaces(&dev.surfaces, &dev.drm);
+    }
+
+    let _ = secondary_paths; // consumed above via gpu_paths
+
+    // 13. Seed active_outputs and queue initial render
+    {
+        let mut backend = backend_state.borrow_mut();
+        for out_dev in backend.devices.values_mut() {
+            for (&crtc, surface) in out_dev.surfaces.iter_mut() {
+                data.active_outputs.insert(surface.output.clone());
+                render_frame(data, &mut surface.compositor, &surface.output, crtc);
+            }
+        }
+        // 14. Notify output management clients of initial state
+        let head_state = collect_output_state_from_devices(&backend.devices);
         driftwm::protocols::output_management::notify_changes::<DriftWm>(
             &mut data.output_management_state,
             head_state,
         );
     }
 
-    Ok(UdevDevice(device))
+    Ok(UdevDevice(backend_state))
+}
+
+/// Open a secondary (non-primary-renderer) DRM device, returning
+/// `(DrmDevice, drm_notifier, GbmDevice)` on success or `None` on any failure.
+/// Uses `false` for DRM ownership (don't displace the existing session owner).
+fn try_open_secondary_device(
+    session: &mut LibSeatSession,
+    path: &std::path::Path,
+    open_flags: OFlags,
+) -> Option<(
+    DrmDevice,
+    smithay::backend::drm::DrmDeviceNotifier,
+    GbmDevice<DrmDeviceFd>,
+)> {
+    let fd = session.open(path, open_flags).ok()?;
+    let device_fd = DrmDeviceFd::new(DeviceFd::from(fd));
+    let (drm, notifier) = DrmDevice::new(device_fd.clone(), false).ok()?;
+    let gbm = GbmDevice::new(device_fd).ok()?;
+    Some((drm, notifier, gbm))
+}
+
+/// Register a per-device DRM event source (VBlank handler).
+fn register_drm_event_source(
+    handle: &smithay::reexports::calloop::LoopHandle<'static, DriftWm>,
+    backend_state: &Rc<RefCell<BackendState>>,
+    node: DrmNode,
+    notifier: smithay::backend::drm::DrmDeviceNotifier,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let backend_for_drm = Rc::clone(backend_state);
+    handle
+        .insert_source(notifier, move |event, meta, data: &mut DriftWm| {
+            let mut backend = backend_for_drm.borrow_mut();
+            let Some(out_dev) = backend.devices.get_mut(&node) else {
+                return;
+            };
+            match event {
+                DrmEvent::VBlank(crtc) => {
+                    let Some(surface) = out_dev.surfaces.get_mut(&crtc) else {
+                        return;
+                    };
+                    match surface.compositor.frame_submitted() {
+                        Ok(Some(mut feedback)) => {
+                            deliver_presentation(&mut feedback, &surface.output, meta.as_ref());
+                        }
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!("frame_submitted error: {e:?}"),
+                    }
+                    data.frames_pending.remove(&crtc);
+                    // Real VBlank beat any estimated-VBlank timer we might have armed.
+                    if let Some(token) = data.estimated_vblank_timers.remove(&crtc) {
+                        data.loop_handle.remove(token);
+                    }
+                    if data.redraws_needed.contains(&surface.output) {
+                        render_frame(data, &mut surface.compositor, &surface.output, crtc);
+                    }
+                }
+                DrmEvent::Error(err) => {
+                    tracing::error!("DRM error: {err}");
+                }
+            }
+        })
+        .map(|_| ())
+        .map_err(|e| format!("Failed to register DRM notifier: {e}").into())
+}
+
+/// Placeholder — used only as a type annotation anchor, never called at runtime.
+fn udev_backend_device_paths(_backend: &BackendState) -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// Build the set of DRM nodes to skip during device discovery from config.
+/// The primary node and primary render node are always excluded from the
+/// ignore set — ignoring your own render device would lock up the compositor.
+fn compute_ignored_nodes(
+    config: &driftwm::config::Config,
+    primary_node: Option<DrmNode>,
+    primary_render_node: Option<DrmNode>,
+) -> HashSet<DrmNode> {
+    let mut result: HashSet<DrmNode> = config
+        .backend
+        .ignore_drm_devices
+        .iter()
+        .filter_map(|path| primary_node_from_drm_path(path))
+        .flat_map(|(primary, render)| [primary, render])
+        .collect();
+
+    let mut warned = false;
+    if let Some(pn) = primary_node
+        && result.remove(&pn)
+    {
+        warned = true;
+    }
+    if let Some(rn) = primary_render_node
+        && result.remove(&rn)
+    {
+        warned = true;
+    }
+    if warned {
+        tracing::warn!(
+            "Ignoring the primary render device is not allowed; \
+             the relevant entries in `ignore_drm_devices` have been overridden."
+        );
+    }
+    result
+}
+
+/// Given a path to any DRM node (render or primary), return `(primary_node, render_node)`.
+///
+/// Mirrors niri's `primary_node_from_render_node`. Handles both render nodes
+/// (the expected case) and primary nodes (graceful misconfiguration handling).
+fn primary_node_from_drm_path(path: &std::path::Path) -> Option<(DrmNode, DrmNode)> {
+    match DrmNode::from_path(path) {
+        Ok(node) if node.ty() == NodeType::Render => {
+            match node.node_with_type(NodeType::Primary).and_then(|r| r.ok()) {
+                Some(primary_node) => Some((primary_node, node)),
+                None => {
+                    tracing::warn!(
+                        "could not get primary node for render node {path:?}; proceeding anyway"
+                    );
+                    Some((node, node))
+                }
+            }
+        }
+        Ok(node) => {
+            tracing::warn!("DRM node {path:?} is not a render node");
+            if let Some(Ok(render_node)) = node.node_with_type(NodeType::Render) {
+                Some((node, render_node))
+            } else {
+                tracing::warn!(
+                    "could not get render node for DRM node {path:?}; proceeding anyway"
+                );
+                Some((node, node))
+            }
+        }
+        Err(e) => {
+            tracing::warn!("error opening {path:?} as DRM node: {e:?}");
+            None
+        }
+    }
+}
+
+/// Return `(primary_node, render_node)` from `backend.render_drm_device` if configured.
+fn primary_node_from_config(config: &driftwm::config::Config) -> Option<(DrmNode, DrmNode)> {
+    let path = config.backend.render_drm_device.as_deref()?;
+    tracing::debug!("attempting to use render node from config: {path:?}");
+    primary_node_from_drm_path(path)
 }
 
 /// Quick check: does this DRM device have any connector in Connected state?
@@ -1681,19 +2021,23 @@ use driftwm::protocols::output_management::{ModeInfo, OutputHeadState};
 /// Drain `data.pending_mode_changes`, applying each via `DrmCompositor::use_mode`.
 /// Entries for outputs with a frame in flight are deferred (bounded retries) so
 /// we don't modeset on top of an in-progress page flip.
-fn apply_pending_mode_changes(
-    drm: &DrmDevice,
-    surfaces: &mut HashMap<crtc::Handle, SurfaceData>,
-    data: &mut DriftWm,
-) {
+fn apply_pending_mode_changes(devices: &mut HashMap<DrmNode, OutputDevice>, data: &mut DriftWm) {
     use smithay::reexports::drm::control::Device as ControlDevice;
     const MAX_RETRIES: u8 = 3;
 
     let pending = std::mem::take(&mut data.pending_mode_changes);
     for (name, mut pm) in pending {
-        let Some((crtc, surface)) = surfaces.iter_mut().find(|(_, s)| s.output.name() == name)
+        // Find the device and surface that own this output.
+        let Some(out_dev) = devices
+            .values_mut()
+            .find(|d| d.surfaces.values().any(|s| s.output.name() == name))
         else {
             tracing::warn!("Mode change for '{name}' dropped: output no longer present");
+            continue;
+        };
+        let OutputDevice { drm, surfaces, .. } = out_dev;
+        let Some((crtc, surface)) = surfaces.iter_mut().find(|(_, s)| s.output.name() == name)
+        else {
             continue;
         };
 
@@ -1767,70 +2111,71 @@ fn apply_pending_mode_changes(
     }
 }
 
-fn collect_output_state_from_surfaces(
-    surfaces: &HashMap<crtc::Handle, SurfaceData>,
-    drm: &DrmDevice,
+fn collect_output_state_from_devices(
+    devices: &HashMap<DrmNode, OutputDevice>,
 ) -> HashMap<String, OutputHeadState> {
     use smithay::reexports::drm::control::Device as ControlDevice;
     let mut result = HashMap::new();
-    for surface in surfaces.values() {
-        let output = &surface.output;
-        let name = output.name();
-        let mode = output.current_mode().unwrap();
-        let transform = output.current_transform();
-        let scale = output.current_scale().fractional_scale();
-        let layout_pos = crate::state::output_state(output).layout_position;
+    for out_dev in devices.values() {
+        for surface in out_dev.surfaces.values() {
+            let output = &surface.output;
+            let name = output.name();
+            let mode = output.current_mode().unwrap();
+            let transform = output.current_transform();
+            let scale = output.current_scale().fractional_scale();
+            let layout_pos = crate::state::output_state(output).layout_position;
 
-        let mut modes: Vec<ModeInfo> =
-            match ControlDevice::get_connector(drm, surface.connector, false) {
-                Ok(info) => info
-                    .modes()
-                    .iter()
-                    .map(|m| ModeInfo {
-                        width: m.size().0 as i32,
-                        height: m.size().1 as i32,
-                        refresh: (m.vrefresh() as i32) * 1000,
-                        preferred: m.mode_type().contains(control::ModeTypeFlags::PREFERRED),
-                    })
-                    .collect(),
-                Err(_) => vec![],
-            };
+            let mut modes: Vec<ModeInfo> =
+                match ControlDevice::get_connector(&out_dev.drm, surface.connector, false) {
+                    Ok(info) => info
+                        .modes()
+                        .iter()
+                        .map(|m| ModeInfo {
+                            width: m.size().0 as i32,
+                            height: m.size().1 as i32,
+                            refresh: (m.vrefresh() as i32) * 1000,
+                            preferred: m.mode_type().contains(control::ModeTypeFlags::PREFERRED),
+                        })
+                        .collect(),
+                    Err(_) => vec![],
+                };
 
-        // If the active mode is a CVT-synthesized one (not in the EDID list),
-        // append it so `wlr-randr` can show it as current. Without this the
-        // user runs `wlr-randr --custom-mode ...`, sees the display change,
-        // and then sees the old mode list with nothing marked current — looks
-        // broken.
-        let mut current_mode_index = modes.iter().position(|m| {
-            m.width == mode.size.w && m.height == mode.size.h && m.refresh == mode.refresh
-        });
-        if current_mode_index.is_none() {
-            modes.push(ModeInfo {
-                width: mode.size.w,
-                height: mode.size.h,
-                refresh: mode.refresh,
-                preferred: false,
+            // If the active mode is a CVT-synthesized one (not in the EDID list),
+            // append it so `wlr-randr` can show it as current. Without this the
+            // user runs `wlr-randr --custom-mode ...`, sees the display change,
+            // and then sees the old mode list with nothing marked current — looks
+            // broken.
+            let mut current_mode_index = modes.iter().position(|m| {
+                m.width == mode.size.w && m.height == mode.size.h && m.refresh == mode.refresh
             });
-            current_mode_index = Some(modes.len() - 1);
-        }
+            if current_mode_index.is_none() {
+                modes.push(ModeInfo {
+                    width: mode.size.w,
+                    height: mode.size.h,
+                    refresh: mode.refresh,
+                    preferred: false,
+                });
+                current_mode_index = Some(modes.len() - 1);
+            }
 
-        let phys = output.physical_properties().size;
-        result.insert(
-            name.clone(),
-            OutputHeadState {
-                name,
-                description: format!("{} {} ({})", surface.make, surface.model, output.name()),
-                make: surface.make.clone(),
-                model: surface.model.clone(),
-                serial_number: surface.serial_number.clone(),
-                physical_size: (phys.w, phys.h),
-                modes,
-                current_mode_index,
-                position: (layout_pos.x, layout_pos.y),
-                transform,
-                scale,
-            },
-        );
+            let phys = output.physical_properties().size;
+            result.insert(
+                name.clone(),
+                OutputHeadState {
+                    name,
+                    description: format!("{} {} ({})", surface.make, surface.model, output.name()),
+                    make: surface.make.clone(),
+                    model: surface.model.clone(),
+                    serial_number: surface.serial_number.clone(),
+                    physical_size: (phys.w, phys.h),
+                    modes,
+                    current_mode_index,
+                    position: (layout_pos.x, layout_pos.y),
+                    transform,
+                    scale,
+                },
+            );
+        }
     }
     result
 }
