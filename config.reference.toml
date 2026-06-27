@@ -461,6 +461,19 @@
                                      # gaming + streaming. One-shot screenshots (grim)
                                      # are never throttled.
 
+# # Override which GPU is used for rendering (udev auto-detection is the default).
+# # Set this on hybrid graphics systems where the default heuristic picks the
+# # wrong GPU, or to pin rendering to a specific render node. Accepts a DRM
+# # render node path (/dev/dri/renderD*) or a primary node (/dev/dri/card*).
+# # render_drm_device = "/dev/dri/renderD128"
+
+# # Skip specific DRM devices during output discovery. Useful for display-only
+# # GPUs that should not be driven by driftwm (e.g. a HDMI capture card that
+# # exposes a DRM node). Accepts primary (/dev/dri/card*) or render
+# # (/dev/dri/renderD*) node paths. The configured primary render device is
+# # always excluded from this list regardless of what is set here.
+# # ignore_drm_devices = ["/dev/dri/card1"]
+
 [output.outline]
 # color = "#ffffff"           # outline color for other monitors' viewports
 # thickness = 1               # pixels (0 to disable)

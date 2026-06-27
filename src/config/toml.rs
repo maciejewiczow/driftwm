@@ -36,6 +36,8 @@ pub(super) struct BackendFileConfig {
     pub disable_direct_scanout: Option<bool>,
     pub disable_hardware_cursor: Option<bool>,
     pub max_capture_fps: Option<u32>,
+    pub render_drm_device: Option<String>,
+    pub ignore_drm_devices: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Default)]

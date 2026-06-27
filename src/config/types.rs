@@ -736,6 +736,13 @@ pub struct BackendConfig {
     /// re-composite a capture forces, which otherwise rides the compositor's
     /// render rate and competes with a fullscreen client behind it.
     pub max_capture_fps: u32,
+    /// Explicit render DRM node. When set, this GPU is used for rendering
+    /// instead of the udev-detected primary GPU.
+    pub render_drm_device: Option<std::path::PathBuf>,
+    /// DRM devices to skip entirely during device discovery. Accepts primary
+    /// node paths (/dev/dri/card*) or render node paths (/dev/dri/renderD*).
+    /// The configured primary render device is always excluded from this list.
+    pub ignore_drm_devices: Vec<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

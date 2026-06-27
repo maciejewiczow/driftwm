@@ -434,6 +434,13 @@ pub(super) fn parse_backend_config(raw: BackendFileConfig) -> BackendConfig {
         disable_direct_scanout: raw.disable_direct_scanout.unwrap_or(false),
         disable_hardware_cursor: raw.disable_hardware_cursor.unwrap_or(false),
         max_capture_fps: raw.max_capture_fps.unwrap_or(0),
+        render_drm_device: raw.render_drm_device.map(|s| std::path::PathBuf::from(s)),
+        ignore_drm_devices: raw
+            .ignore_drm_devices
+            .unwrap_or_default()
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect(),
     }
 }
 
