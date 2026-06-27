@@ -673,6 +673,7 @@ pub fn init_udev(
                     &mut primary_drm,
                     &primary_gbm,
                     &render_formats,
+                    Some(render_node),
                     &connector,
                     crtc,
                     &dh,
@@ -855,6 +856,23 @@ pub fn init_udev(
                     let Ok(node) = DrmNode::from_dev_id(device_id) else {
                         return;
                     };
+                    // Gather per-device cross-GPU info before the mutable borrow.
+                    // For display-only secondary devices (render_node None), fall back
+                    // to primary GPU formats; create_surface will further restrict them
+                    // to linear modifiers for cross-device DMA-BUF compatibility.
+                    let primary_node = backend.primary_node;
+                    let device_render_node = backend.devices.get(&node).and_then(|d| d.render_node);
+                    let hotplug_render_formats: Vec<Format> = backend
+                        .devices
+                        .get(&node)
+                        .filter(|d| !d.render_formats.is_empty())
+                        .map(|d| d.render_formats.clone())
+                        .unwrap_or_else(|| {
+                            backend
+                                .devices
+                                .get(&primary_node)
+                                .map_or_else(Vec::new, |d| d.render_formats.clone())
+                        });
                     let Some(out_dev) = backend.devices.get_mut(&node) else {
                         return;
                     };
@@ -862,7 +880,6 @@ pub fn init_udev(
                         ref mut drm_scanner,
                         ref mut drm,
                         ref gbm,
-                        ref render_formats,
                         ref mut surfaces,
                         ..
                     } = *out_dev;
@@ -905,7 +922,8 @@ pub fn init_udev(
                                     if let Some(sd) = create_surface(
                                         drm,
                                         gbm,
-                                        render_formats,
+                                        &hotplug_render_formats,
+                                        device_render_node,
                                         &connector,
                                         crtc,
                                         &dh,
@@ -1447,6 +1465,7 @@ fn create_surface(
     drm: &mut DrmDevice,
     gbm: &GbmDevice<DrmDeviceFd>,
     render_formats: &[Format],
+    device_render_node: Option<DrmNode>,
     connector: &connector::Info,
     crtc: crtc::Handle,
     dh: &smithay::reexports::wayland_server::DisplayHandle,
@@ -1562,6 +1581,24 @@ fn create_surface(
     );
     output.set_preferred(output_mode);
     let global = output.create_global::<DriftWm>(dh);
+
+    // For display-only devices (no local render node), rendering happens on the
+    // primary GPU but the framebuffer is exported to this device. Restrict to
+    // linear modifiers for cross-GPU DMA-BUF compatibility.
+    let linear_formats_owned: Vec<Format>;
+    let render_formats: &[Format] = if device_render_node.is_none() {
+        tracing::debug!(
+            "Output {connector_name}: display-only device, restricting render formats to linear"
+        );
+        linear_formats_owned = render_formats
+            .iter()
+            .copied()
+            .filter(|f| f.modifier == Modifier::Linear)
+            .collect();
+        &linear_formats_owned
+    } else {
+        render_formats
+    };
 
     let allocator = GbmAllocator::new(
         gbm.clone(),
