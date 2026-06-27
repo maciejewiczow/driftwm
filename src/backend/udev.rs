@@ -18,7 +18,7 @@ use smithay::{
         },
         egl::{EGLContext, EGLDevice, EGLDisplay, context::ContextPriority},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
-        renderer::ImportDma,
+        renderer::{ImportDma, multigpu::GpuManager, multigpu::gbm::GbmGlesBackend},
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
         udev::{self, UdevBackend, UdevEvent},
     },
@@ -66,6 +66,12 @@ struct OutputDevice {
     drm_scanner: DrmScanner,
     surfaces: HashMap<crtc::Handle, SurfaceData>,
     render_formats: Vec<Format>,
+    /// The EGL render node for this device, if it was successfully added to the
+    /// `GpuManager`. `None` for devices that failed EGL init and fall back to
+    /// primary-GPU rendering.
+    // Read by the multi-GPU render path (roadmap step 7).
+    #[allow(dead_code)]
+    render_node: Option<DrmNode>,
 }
 
 struct BackendState {
@@ -74,6 +80,10 @@ struct BackendState {
     libinput: Libinput,
     /// The primary render GPU. Surfaces on this device use the active GLES renderer.
     primary_node: DrmNode,
+    /// Multi-GPU manager: tracks all render-capable devices as EGL nodes. Used for
+    /// cross-GPU PRIME rendering (roadmap points 3+).
+    gpu_manager:
+        GpuManager<GbmGlesBackend<smithay::backend::renderer::gles::GlesRenderer, DrmDeviceFd>>,
 }
 
 /// Opaque handle to udev backend state. Returned by init_udev,
@@ -367,6 +377,11 @@ pub fn init_udev(
     // 2. Enumerate GPUs — UdevBackend gives us all DRM devices (also used for hotplug later)
     let udev_backend = UdevBackend::new(&seat_name)?;
 
+    // Initialize the GPU manager early so devices can be registered as they are discovered.
+    let api = GbmGlesBackend::<smithay::backend::renderer::gles::GlesRenderer, DrmDeviceFd>::with_context_priority(ContextPriority::High);
+    let mut gpu_manager =
+        GpuManager::new(api).map_err(|e| format!("Failed to create GpuManager: {e}"))?;
+
     // Determine the primary GPU: prefer an explicit config override, then fall
     // back to what udev reports as the session's primary GPU. The path here is
     // the KMS/primary node (e.g. /dev/dri/card0), not the render node.
@@ -564,6 +579,18 @@ pub fn init_udev(
     data.backend = Some(Backend::Udev(Box::new(renderer)));
     let formats = data.backend.as_mut().unwrap().renderer().dmabuf_formats();
     data.render_device = Some(render_node.dev_id());
+
+    // Register the primary GPU's render node with the GpuManager. This is the
+    // foundation of the PRIME render path — secondary devices added later will
+    // export their output through this node.
+    if let Err(e) = gpu_manager
+        .as_mut()
+        .add_node(render_node, primary_gbm.clone())
+    {
+        tracing::warn!("Failed to add primary GPU render node {render_node:?} to GpuManager: {e}");
+    } else {
+        tracing::info!("Primary GPU render node {render_node:?} added to GpuManager");
+    }
     // Capture clients allocate buffers we render INTO, so advertise the
     // render-target set (already CCS-filtered above) — not the wider
     // import set, which can include formats we can't bind as a target.
@@ -687,6 +714,7 @@ pub fn init_udev(
         drm_scanner: primary_drm_scanner,
         surfaces: primary_surfaces,
         render_formats,
+        render_node: Some(render_node),
     };
     let mut initial_devices: HashMap<DrmNode, OutputDevice> = HashMap::new();
     initial_devices.insert(primary_node, primary_output_device);
@@ -695,6 +723,7 @@ pub fn init_udev(
         devices: initial_devices,
         libinput,
         primary_node,
+        gpu_manager,
     }));
 
     // 9. Register DRM event source for the primary device (VBlank handler)
@@ -944,12 +973,20 @@ pub fn init_udev(
                     match try_open_secondary_device(session, &path, open_flags) {
                         Some((drm, drm_notifier, gbm)) => {
                             tracing::info!("Secondary GPU discovered: {path:?}");
+                            let render_node =
+                                try_add_to_gpu_manager(&mut backend.gpu_manager, &gbm, node);
+                            if render_node.is_some() {
+                                tracing::info!(
+                                    "Hotplug GPU {path:?} registered in GpuManager as {render_node:?}"
+                                );
+                            }
                             let out_dev = OutputDevice {
                                 drm,
                                 gbm,
                                 drm_scanner: DrmScanner::new(),
                                 surfaces: HashMap::new(),
                                 render_formats: Vec::new(),
+                                render_node,
                             };
                             backend.devices.insert(node, out_dev);
                             if let Err(e) = register_drm_event_source(
@@ -982,9 +1019,7 @@ pub fn init_udev(
     );
     event_loop.handle().register_dispatcher(udev_dispatcher)?;
 
-    // 12. Discover secondary GPUs. These are all non-primary DRM primary nodes
-    //     not in the ignore list. We open them and track them; surfaces will be
-    //     created when GpuManager support is added (roadmap point 3).
+    // 12. Discover secondary GPUs and register them with the GpuManager.
     let secondary_paths: Vec<PathBuf> = udev_backend_device_paths(&backend_state.borrow())
         .into_iter()
         .filter(|path| {
@@ -1015,12 +1050,24 @@ pub fn init_udev(
             match try_open_secondary_device(session, path, open_flags) {
                 Some((drm, drm_notifier, gbm)) => {
                     tracing::info!("Secondary GPU: {}", path.display());
+                    let render_node = try_add_to_gpu_manager(
+                        &mut backend_state.borrow_mut().gpu_manager,
+                        &gbm,
+                        node,
+                    );
+                    if render_node.is_some() {
+                        tracing::info!(
+                            "Secondary GPU {} registered in GpuManager as {render_node:?}",
+                            path.display()
+                        );
+                    }
                     let out_dev = OutputDevice {
                         drm,
                         gbm,
                         drm_scanner: DrmScanner::new(),
                         surfaces: HashMap::new(),
                         render_formats: Vec::new(),
+                        render_node,
                     };
                     backend_state.borrow_mut().devices.insert(node, out_dev);
                     register_drm_event_source(
@@ -1062,6 +1109,32 @@ pub fn init_udev(
 /// Open a secondary (non-primary-renderer) DRM device, returning
 /// `(DrmDevice, drm_notifier, GbmDevice)` on success or `None` on any failure.
 /// Uses `false` for DRM ownership (don't displace the existing session owner).
+/// Try to initialize EGL for `gbm` and register the device's render node with
+/// `gpu_manager`. Returns the render node on success, or `None` if EGL init
+/// fails (the caller should fall back to the primary GPU).
+fn try_add_to_gpu_manager(
+    gpu_manager: &mut GpuManager<
+        GbmGlesBackend<smithay::backend::renderer::gles::GlesRenderer, DrmDeviceFd>,
+    >,
+    gbm: &GbmDevice<DrmDeviceFd>,
+    fallback_node: DrmNode,
+) -> Option<DrmNode> {
+    let display = unsafe { EGLDisplay::new(gbm.clone()).ok()? };
+    let egl_device = EGLDevice::device_for_display(&display).ok()?;
+    let render_node = egl_device
+        .try_get_render_node()
+        .ok()
+        .flatten()
+        .unwrap_or(fallback_node);
+    match gpu_manager.as_mut().add_node(render_node, gbm.clone()) {
+        Ok(()) => Some(render_node),
+        Err(e) => {
+            tracing::warn!("Failed to add render node {render_node:?} to GpuManager: {e}");
+            None
+        }
+    }
+}
+
 fn try_open_secondary_device(
     session: &mut LibSeatSession,
     path: &std::path::Path,
