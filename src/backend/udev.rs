@@ -19,7 +19,12 @@ use smithay::{
         },
         egl::{EGLContext, EGLDevice, EGLDisplay, context::ContextPriority},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
-        renderer::{ImportDma, ImportEgl, multigpu::GpuManager, multigpu::gbm::GbmGlesBackend},
+        renderer::{
+            ImportDma, ImportEgl, RendererSuper,
+            element::{RenderElement, UnderlyingStorage},
+            gles::GlesRenderer,
+            multigpu::{GpuManager, MultiFrame, MultiRenderer, gbm::GbmGlesBackend},
+        },
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
         udev::{self, UdevBackend, UdevEvent},
     },
@@ -34,7 +39,8 @@ use smithay::{
         input::Libinput,
         rustix::fs::OFlags,
     },
-    utils::{DeviceFd, Transform},
+    utils::user_data::UserDataMap,
+    utils::{Buffer as BufferCoords, DeviceFd, Physical, Rectangle, Transform},
     wayland::dmabuf::{DmabufFeedback, DmabufFeedbackBuilder},
 };
 
@@ -62,6 +68,73 @@ type GbmDrmCompositor = DrmCompositor<
     DrmDeviceFd,
 >;
 
+/// Multi-GPU renderer for the udev/KMS backend. Created per-frame via
+/// `GpuManager::renderer(primary_node, output_node, format)`; handles both
+/// same-GPU (pass-through) and cross-GPU PRIME rendering automatically.
+pub(crate) type UdevRenderer<'render> = MultiRenderer<
+    'render,
+    'render,
+    GbmGlesBackend<GlesRenderer, DrmDeviceFd>,
+    GbmGlesBackend<GlesRenderer, DrmDeviceFd>,
+>;
+
+/// Frame produced by [`UdevRenderer`].
+pub(crate) type UdevFrame<'render, 'frame, 'buf> = MultiFrame<
+    'render,
+    'render,
+    'frame,
+    'buf,
+    GbmGlesBackend<GlesRenderer, DrmDeviceFd>,
+    GbmGlesBackend<GlesRenderer, DrmDeviceFd>,
+>;
+
+/// Error type produced by [`UdevRenderer`].
+pub(crate) type UdevRendererError<'render> = <UdevRenderer<'render> as RendererSuper>::Error;
+
+/// Bridge `OutputRenderElements` (typed to `GlesRenderer`) into the
+/// multi-GPU render path by delegating through the underlying `GlesFrame`
+/// and `GlesRenderer` that the `UdevRenderer` wraps.
+impl<'render> RenderElement<UdevRenderer<'render>> for OutputRenderElements {
+    fn draw(
+        &self,
+        frame: &mut UdevFrame<'render, '_, '_>,
+        src: Rectangle<f64, BufferCoords>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), UdevRendererError<'render>> {
+        RenderElement::<GlesRenderer>::draw(
+            self,
+            frame.as_mut(),
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            cache,
+        )?;
+        Ok(())
+    }
+
+    fn underlying_storage(
+        &self,
+        renderer: &mut UdevRenderer<'render>,
+    ) -> Option<UnderlyingStorage<'_>> {
+        RenderElement::<GlesRenderer>::underlying_storage(self, renderer.as_mut())
+    }
+
+    fn capture_framebuffer(
+        &self,
+        frame: &mut UdevFrame<'render, '_, '_>,
+        src: Rectangle<f64, BufferCoords>,
+        dst: Rectangle<i32, Physical>,
+        cache: &UserDataMap,
+    ) -> Result<(), UdevRendererError<'render>> {
+        RenderElement::<GlesRenderer>::capture_framebuffer(self, frame.as_mut(), src, dst, cache)?;
+        Ok(())
+    }
+}
+
 struct OutputDevice {
     drm: DrmDevice,
     gbm: GbmDevice<DrmDeviceFd>,
@@ -71,8 +144,6 @@ struct OutputDevice {
     /// The EGL render node for this device, if it was successfully added to the
     /// `GpuManager`. `None` for devices that failed EGL init and fall back to
     /// primary-GPU rendering.
-    // Read by the multi-GPU render path (roadmap step 7).
-    #[allow(dead_code)]
     render_node: Option<DrmNode>,
 }
 
@@ -352,7 +423,17 @@ pub(crate) fn render_if_needed(data: &mut DriftWm) {
     }
 
     // Render outputs that need it.
-    for out_dev in dev.devices.values_mut() {
+    // Split-borrow BackendState so we can pass &mut gpu_manager into render_frame
+    // while also iterating over devices. DrmNode is Copy, so primary_render_node
+    // is captured before the destructure.
+    let primary_render_node = dev.primary_render_node;
+    let BackendState {
+        devices,
+        gpu_manager,
+        ..
+    } = &mut *dev;
+    for out_dev in devices.values_mut() {
+        let output_render_node = out_dev.render_node;
         for (&crtc, surface) in out_dev.surfaces.iter_mut() {
             if data.dpms_off_outputs.contains(&surface.output) {
                 data.redraws_needed.remove(&surface.output);
@@ -370,6 +451,9 @@ pub(crate) fn render_if_needed(data: &mut DriftWm) {
                     &surface.output,
                     crtc,
                     surface.dmabuf_feedback.as_ref(),
+                    gpu_manager,
+                    primary_render_node,
+                    output_render_node,
                 );
             }
         }
@@ -837,8 +921,11 @@ pub fn init_udev(
                     data.dpms_off_outputs.clear();
                     data.pending_dpms.clear();
                     driftwm::protocols::output_power::OutputPowerState::refresh(data);
-                    for out_dev in backend.devices.values_mut() {
-                        let OutputDevice { drm, surfaces, .. } = out_dev;
+                    let primary_render_node = backend.primary_render_node;
+                    let BackendState { devices, gpu_manager, .. } = &mut *backend;
+                    for out_dev in devices.values_mut() {
+                        let output_render_node = out_dev.render_node;
+                        let OutputDevice { ref mut drm, ref mut surfaces, .. } = *out_dev;
                         for (&crtc, surface) in surfaces.iter_mut() {
                             if let Err(e) = surface.compositor.reset_state() {
                                 tracing::warn!("Failed to reset DRM surface state: {e}");
@@ -864,7 +951,16 @@ pub fn init_udev(
                                     );
                                 }
                             }
-                            render_frame(data, &mut surface.compositor, &surface.output, crtc, surface.dmabuf_feedback.as_ref());
+                            render_frame(
+                                data,
+                                &mut surface.compositor,
+                                &surface.output,
+                                crtc,
+                                surface.dmabuf_feedback.as_ref(),
+                                gpu_manager,
+                                primary_render_node,
+                                output_render_node,
+                            );
                         }
                     }
                 }
@@ -901,7 +997,12 @@ pub fn init_udev(
                                 .get(&primary_node)
                                 .map_or_else(Vec::new, |d| d.render_formats.clone())
                         });
-                    let Some(out_dev) = backend.devices.get_mut(&node) else {
+                    let BackendState {
+                        ref mut devices,
+                        ref mut gpu_manager,
+                        ..
+                    } = *backend;
+                    let Some(out_dev) = devices.get_mut(&node) else {
                         return;
                     };
                     let OutputDevice {
@@ -978,6 +1079,9 @@ pub fn init_udev(
                                             &surface.output,
                                             crtc,
                                             surface.dmabuf_feedback.as_ref(),
+                                            gpu_manager,
+                                            hotplug_primary_render_node,
+                                            device_render_node,
                                         );
                                     }
                                 }
@@ -1155,7 +1259,14 @@ pub fn init_udev(
     // 13. Seed active_outputs and queue initial render
     {
         let mut backend = backend_state.borrow_mut();
-        for out_dev in backend.devices.values_mut() {
+        let primary_render_node = backend.primary_render_node;
+        let BackendState {
+            devices,
+            gpu_manager,
+            ..
+        } = &mut *backend;
+        for out_dev in devices.values_mut() {
+            let output_render_node = out_dev.render_node;
             for (&crtc, surface) in out_dev.surfaces.iter_mut() {
                 data.active_outputs.insert(surface.output.clone());
                 render_frame(
@@ -1164,11 +1275,14 @@ pub fn init_udev(
                     &surface.output,
                     crtc,
                     surface.dmabuf_feedback.as_ref(),
+                    gpu_manager,
+                    primary_render_node,
+                    output_render_node,
                 );
             }
         }
         // 14. Notify output management clients of initial state
-        let head_state = collect_output_state_from_devices(&backend.devices);
+        let head_state = collect_output_state_from_devices(devices);
         driftwm::protocols::output_management::notify_changes::<DriftWm>(
             &mut data.output_management_state,
             head_state,
@@ -1234,9 +1348,16 @@ fn register_drm_event_source(
     handle
         .insert_source(notifier, move |event, meta, data: &mut DriftWm| {
             let mut backend = backend_for_drm.borrow_mut();
-            let Some(out_dev) = backend.devices.get_mut(&node) else {
+            let primary_render_node = backend.primary_render_node;
+            let BackendState {
+                devices,
+                gpu_manager,
+                ..
+            } = &mut *backend;
+            let Some(out_dev) = devices.get_mut(&node) else {
                 return;
             };
+            let output_render_node = out_dev.render_node;
             match event {
                 DrmEvent::VBlank(crtc) => {
                     let Some(surface) = out_dev.surfaces.get_mut(&crtc) else {
@@ -1261,6 +1382,9 @@ fn register_drm_event_source(
                             &surface.output,
                             crtc,
                             surface.dmabuf_feedback.as_ref(),
+                            gpu_manager,
+                            primary_render_node,
+                            output_render_node,
                         );
                     }
                 }
@@ -2010,6 +2134,9 @@ fn render_frame(
     output: &Output,
     crtc: crtc::Handle,
     dmabuf_feedback: Option<&SurfaceDmabufFeedback>,
+    gpu_manager: &mut GpuManager<GbmGlesBackend<GlesRenderer, DrmDeviceFd>>,
+    primary_render_node: DrmNode,
+    output_render_node: Option<DrmNode>,
 ) {
     #[cfg(feature = "profile-with-tracy")]
     let _span = tracy_client::span!("udev::render_frame");
@@ -2072,9 +2199,21 @@ fn render_frame(
         }
     }
 
-    // Take renderer out to split borrow from state
-    let mut backend = data.backend.take().unwrap();
-    let renderer = backend.renderer();
+    // Create a multi-GPU renderer for this frame. For same-GPU outputs
+    // (primary_render_node == output_render_node) this is a transparent
+    // pass-through; for PRIME systems it handles cross-device buffer export.
+    let output_node = output_render_node.unwrap_or(primary_render_node);
+    let mut renderer =
+        match gpu_manager.renderer(&primary_render_node, &output_node, compositor.format()) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to create multi-GPU renderer for '{}': {e:?}",
+                    output.name()
+                );
+                return;
+            }
+        };
 
     // Build cursor + compose frame
     let cursor_alpha = if data.active_output().as_ref() == Some(output) {
@@ -2086,7 +2225,7 @@ fn render_frame(
     let _cursor_span = tracy_client::span!("udev::build_cursor_elements");
     let cursor_elements = crate::render::build_cursor_elements(
         data,
-        renderer,
+        renderer.as_mut(),
         cur_camera,
         cur_zoom,
         output.current_scale().fractional_scale(),
@@ -2094,8 +2233,7 @@ fn render_frame(
     );
     #[cfg(feature = "profile-with-tracy")]
     drop(_cursor_span);
-    let renderer = backend.renderer();
-    let elements = crate::render::compose_frame(data, renderer, output, cursor_elements);
+    let elements = crate::render::compose_frame(data, renderer.as_mut(), output, cursor_elements);
 
     // Overlay planes are left off — they cause hard-to-diagnose flicker on some
     // hardware. disable_hardware_cursor composites the cursor into the frame instead
@@ -2115,11 +2253,10 @@ fn render_frame(
     }
 
     // Render via DRM compositor (latency-sensitive — do first)
-    let renderer = backend.renderer();
     #[cfg(feature = "profile-with-tracy")]
     let _composite_span = tracy_client::span!("udev::compositor_render_frame");
     let render_result = compositor.render_frame::<_, OutputRenderElements>(
-        renderer,
+        &mut renderer,
         &elements,
         [0.0f32, 0.0, 0.0, 1.0],
         frame_flags,
@@ -2180,19 +2317,12 @@ fn render_frame(
     // Fulfill capture requests after main render
     #[cfg(feature = "profile-with-tracy")]
     let _captures_span = tracy_client::span!("udev::captures");
-    let renderer = backend.renderer();
-    crate::render::render_screencopy(data, renderer, output, &elements);
-
-    let renderer = backend.renderer();
-    crate::render::render_capture_frames(data, renderer, output, &elements);
-
-    let renderer = backend.renderer();
-    crate::render::render_toplevel_captures(data, renderer);
+    crate::render::render_screencopy(data, renderer.as_mut(), output, &elements);
+    crate::render::render_capture_frames(data, renderer.as_mut(), output, &elements);
+    crate::render::render_toplevel_captures(data, renderer.as_mut());
     #[cfg(feature = "profile-with-tracy")]
     drop(_captures_span);
-
-    // Put backend back
-    data.backend = Some(backend);
+    // (renderer dropped here — the GpuManager borrow is released)
 
     // Record camera+zoom for next-frame change detection
     {

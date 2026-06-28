@@ -317,3 +317,67 @@ let images = xcursor::parser::parse_xcursor(&std::fs::read(path)?)?;
 
 - **Temporaries in `if let` live until end of block** — separate `let x = expr.cloned(); if let Some(x) = x {` when needing `&mut self` inside the block.
 - **DMA-BUF blocker uses let-chains** — `if let Some(dmabuf) = ... && let Ok((blocker, source)) = ... && let Some(client) = ... { }` is idiomatic Rust 2024.
+
+## Multi-GPU / PRIME Rendering (`smithay::backend::renderer::multigpu`)
+
+### `GpuManager<A: GraphicsApi>`
+Tracks render-capable GPU devices. Registered via `add_node(render_node, gbm)`.
+
+```rust
+// Create with a GbmGlesBackend (high-priority EGL context):
+let api = GbmGlesBackend::<GlesRenderer, DrmDeviceFd>::with_context_priority(ContextPriority::High);
+let mut gpu_manager = GpuManager::new(api)?;
+
+// Register a GPU node:
+gpu_manager.add_node(render_node: DrmNode, gbm: GbmDevice<DrmDeviceFd>)?;
+
+// Create a per-frame multi-GPU renderer:
+// source=primary GPU, target=output GPU, format=DRM framebuffer format
+let mut renderer = gpu_manager.renderer(&primary_render_node, &output_render_node, format)?;
+
+// Access the primary GlesRenderer (for init/screencopy):
+let mut single = gpu_manager.single_renderer(&primary_render_node)?; // -> MultiRenderer (single-device)
+```
+
+### `MultiRenderer<'render, 'render, R, T>` (type alias: `UdevRenderer<'render>`)
+Created per-frame from `GpuManager::renderer()`. When source==target (same GPU), transparent pass-through.
+For PRIME (source≠target), handles cross-device dmabuf export automatically.
+
+```rust
+// Get the underlying GlesRenderer from a MultiRenderer:
+renderer.as_mut() -> &mut GlesRenderer    // (AsMut<GlesRenderer>)
+
+// Get the underlying GlesFrame from a MultiFrame:
+frame.as_mut() -> &mut GlesFrame<'frame, 'buffer>   // (AsMut<GlesFrame>)
+```
+
+### `MultiFrame` (type alias: `UdevFrame<'render, 'frame, 'buf>`)
+Frame type produced by `MultiRenderer::render(...)`. Delegates to the primary GlesRenderer's frame.
+
+### `Error<R, T>` — MultiRenderer error
+`From<GlesError>` is provided for `MultiError<GbmGlesBackend<GlesRenderer, A>, T>` (wraps as `Error::Render`).
+This makes `?` work when delegating `RenderElement<GlesRenderer>` draw calls from inside a `RenderElement<UdevRenderer>` impl.
+
+### Bridging `RenderElement<GlesRenderer>` to `RenderElement<UdevRenderer>`
+Pattern for adding `UdevRenderer` support to a `GlesRenderer`-only element type:
+```rust
+impl<'render> RenderElement<UdevRenderer<'render>> for MyElement {
+    fn draw(&self, frame: &mut UdevFrame<'render, '_, '_>, ...) -> Result<(), UdevRendererError<'render>> {
+        RenderElement::<GlesRenderer>::draw(self, frame.as_mut(), ...)?;
+        Ok(())
+    }
+    fn underlying_storage(&self, renderer: &mut UdevRenderer<'render>) -> Option<UnderlyingStorage<'_>> {
+        RenderElement::<GlesRenderer>::underlying_storage(self, renderer.as_mut())
+    }
+}
+```
+
+### Split-borrow pattern for `BackendState`
+To pass `&mut gpu_manager` and iterate `devices` simultaneously, destructure the struct:
+```rust
+let BackendState { devices, gpu_manager, .. } = &mut *backend; // or &mut *borrow_mut
+for out_dev in devices.values_mut() {
+    let output_render_node = out_dev.render_node;  // Copy before inner borrow
+    render_frame(..., gpu_manager, primary_render_node, output_render_node);
+}
+```
