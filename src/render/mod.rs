@@ -7,6 +7,7 @@ mod elements;
 mod error_bar;
 mod layers;
 mod lifecycle;
+mod primary_gpu_texture;
 mod screenshot;
 mod shader_chunks;
 mod shaders;
@@ -27,6 +28,7 @@ pub use lifecycle::{
     post_render, refresh_foreign_toplevels, send_dmabuf_feedbacks, send_frame_callbacks_fallback,
     take_presentation_feedback, update_primary_scanout_output,
 };
+pub use primary_gpu_texture::PrimaryGpuTextureRenderElement;
 pub use screenshot::capture_region_to_png;
 pub use shader_chunks::ShaderChunkCache;
 pub use shaders::{
