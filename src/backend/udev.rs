@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use smithay::reexports::wayland_server::backend::GlobalId;
 use smithay::{
+    backend::allocator::dmabuf::Dmabuf,
     backend::allocator::format::FormatSet,
     backend::{
         allocator::{
@@ -30,6 +31,7 @@ use smithay::{
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1,
+    reexports::wayland_server::protocol::wl_surface::WlSurface,
     reexports::{
         calloop::{
             Dispatcher, EventLoop,
@@ -234,6 +236,44 @@ impl UdevDevice {
             }
         }
         None
+    }
+
+    /// Import a dmabuf through the primary GPU renderer and tag it with the
+    /// primary render node so the multi-GPU path can resolve it later.
+    /// Returns `true` on success; the compositor should reject the buffer otherwise.
+    pub(crate) fn import_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        let mut backend = self.0.borrow_mut();
+        let primary_render_node = backend.primary_render_node;
+        let mut renderer = match backend.gpu_manager.single_renderer(&primary_render_node) {
+            Ok(renderer) => renderer,
+            Err(err) => {
+                tracing::debug!("error creating renderer for primary GPU: {err:?}");
+                return false;
+            }
+        };
+        match renderer.import_dmabuf(dmabuf, None) {
+            Ok(_texture) => {
+                dmabuf.set_node(Some(primary_render_node));
+                true
+            }
+            Err(err) => {
+                tracing::debug!("error importing dmabuf: {err:?}");
+                false
+            }
+        }
+    }
+
+    /// Pre-import a surface's buffer on the primary GPU before commit completes.
+    /// Allows the multi-GPU path to avoid a stall on first use of a cross-GPU texture.
+    pub(crate) fn early_import(&self, surface: &WlSurface) {
+        let mut backend = self.0.borrow_mut();
+        let primary_render_node = backend.primary_render_node;
+        if let Err(err) = backend
+            .gpu_manager
+            .early_import(primary_render_node, surface)
+        {
+            tracing::warn!("error doing early import: {err:?}");
+        }
     }
 
     /// Apply a gamma ramp (or reset to identity if `None`). Atomic path if

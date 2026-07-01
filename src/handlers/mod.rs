@@ -200,11 +200,14 @@ impl DmabufHandler for DriftWm {
         dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
         notifier: ImportNotifier,
     ) {
-        let Some(backend) = self.backend.as_mut() else {
-            notifier.failed();
-            return;
+        let imported = if let Some(udev) = self.udev_device.as_ref() {
+            udev.import_dmabuf(&dmabuf)
+        } else if let Some(backend) = self.backend.as_mut() {
+            backend.renderer().import_dmabuf(&dmabuf, None).is_ok()
+        } else {
+            false
         };
-        if backend.renderer().import_dmabuf(&dmabuf, None).is_ok() {
+        if imported {
             let _ = notifier.successful::<DriftWm>();
         } else {
             notifier.failed();
